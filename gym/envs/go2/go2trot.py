@@ -205,9 +205,14 @@ class Go2Trot(LeggedRobot):
         """Penalize non-flat base orientation"""
         error = (
             torch.square(self.projected_gravity[:, :2])
-            / self.cfg.reward_settings.tracking_sigma
+            / 0.05
         )
         return torch.sum(torch.exp(-error), dim=1)
+    def _reward_hip_splay(self):
+        """Penalize hip abduction away from the default stance"""
+        hips = [0, 3, 6, 9]  # FL, FR, RL, RR hip joints in canonical order
+        error = self.dof_pos[:, hips] - self.default_dof_pos[:, hips]
+        return -torch.sum(torch.square(error), dim=1)
 
     def _reward_min_base_height(self):
         """Squared exponential saturating at base_height target"""
@@ -218,8 +223,10 @@ class Go2Trot(LeggedRobot):
 
     def _reward_tracking_base_height(self):
         """Track the commanded base height"""
-        error = (self.base_height - self.base_height_target) / self.scales["base_height"]
-        return self._sqrdexp(error.flatten(), sigma=0.1)
+        error = (
+            (self.base_height - self.base_height_target).flatten()
+            / self.scales["base_height"])
+        return self._sqrdexp(error, sigma=0.03) - 0.5 * error.abs()
 
     def _reward_tracking_lin_vel(self):
         """Tracking of linear velocity commands (xy axes)"""

@@ -48,6 +48,9 @@ class Go2Trot(LeggedRobot):
             dtype=torch.float,
             device=self.device,
         )
+        self.base_height_target = torch.zeros(
+            self.num_envs, 1, dtype=torch.float, device=self.device
+        )
         self._update_phase_observation()
         self._update_gait_reference()
 
@@ -117,6 +120,13 @@ class Go2Trot(LeggedRobot):
                 torch.rand(self.num_envs, 1, device=self.device) >= 0.9
             )
             self.commands.masked_fill_(drop, 0.0)
+
+        height = torch_rand_float(
+            *self.command_ranges["base_height"],
+            shape=self.base_height_target.shape,
+            device=self.device,
+        )
+        masked_update(self.base_height_target, height, command_mask)
 
     def _reset_idx(self, reset_mask):
         super()._reset_idx(reset_mask)
@@ -205,6 +215,11 @@ class Go2Trot(LeggedRobot):
         error /= self.scales["base_height"]
         error = torch.clamp(error, max=0, min=None).flatten()
         return self._sqrdexp(error)
+
+    def _reward_tracking_base_height(self):
+        """Track the commanded base height"""
+        error = (self.base_height - self.base_height_target) / self.scales["base_height"]
+        return self._sqrdexp(error.flatten(), sigma=0.1)
 
     def _reward_tracking_lin_vel(self):
         """Tracking of linear velocity commands (xy axes)"""

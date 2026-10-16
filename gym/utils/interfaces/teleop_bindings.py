@@ -53,7 +53,7 @@ HELP_LINES = (
     "  I/K           forward / back",
     "  J/L           strafe left / strafe right",
     "  N/M           yaw left / yaw right",
-    "  Up/Down       up / down (command effects: student TODO)",
+    "  Up/Down       stand up / crouch down",
     "  R             reset envs",
     "  Esc / window  quit",
     "  commands step in 1/5 increments of max",
@@ -84,6 +84,13 @@ class TeleopCommands:
         if hasattr(env.cfg, "commands"):
             env.cfg.commands.resampling_time = env.max_episode_length_s + 1
 
+        self.has_height = hasattr(env, "base_height_target")
+        if self.has_height:
+            self.min_height, self.max_height = env.command_ranges["base_height"]
+            self.increment_height = (self.max_height - self.min_height) * 0.1
+            env.base_height_target[:] = 0.5 * (self.min_height + self.max_height)
+
+
     def apply(self, action: str) -> None:
         """Apply one discrete press of ``action`` (see BINDINGS)."""
         c = self.env.commands
@@ -101,6 +108,18 @@ class TeleopCommands:
             c[:, 2] = torch.clamp(c[:, 2] + self.increment_yaw, max=self.max_vel_yaw)
         elif action == "yaw_right":
             c[:, 2] = torch.clamp(c[:, 2] - self.increment_yaw, min=-self.max_vel_yaw)
+
+        elif action == "up":
+            if self.has_height:
+                h = self.env.base_height_target
+                h[:] = torch.clamp(h + self.increment_height, max=self.max_height)
+                print(f"base height target: {h[0].item():.3f} m")
+        elif action == "down":
+            if self.has_height:
+                h = self.env.base_height_target
+                h[:] = torch.clamp(h - self.increment_height, min=self.min_height)
+                print(f"base height target: {h[0].item():.3f} m")
+
         elif action == "reset":
             self.env.timed_out[:] = True
             self.env.reset()

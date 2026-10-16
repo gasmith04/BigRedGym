@@ -62,10 +62,10 @@ class Go2TrotCfg(Go2Cfg):
         var = 0.1
 
         class ranges(Go2Cfg.commands.ranges):
-            lin_vel_x = [-0.5, 0.0, 0.5, 1.0, 2.0]
+            lin_vel_x = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.75, 2.5]
             lin_vel_y = 0.5
             yaw_vel = 1.5
-            base_height = [0.18, 0.38]
+            base_height = [0.18, 0.35]
             #test these numbers and expand the range if everything works
 
     class push_robots(Go2Cfg.push_robots):
@@ -162,7 +162,7 @@ class Go2TrotRunnerCfg(Go2RunnerCfg):
 
         class reward:
             class weights:
-                tracking_lin_vel = 4.0
+                tracking_lin_vel = 6.0
                 tracking_ang_vel = 4.0
                 lin_vel_z = 0.0
                 ang_vel_xy = 0.01
@@ -178,9 +178,9 @@ class Go2TrotRunnerCfg(Go2RunnerCfg):
                 action_rate2 = 0.05
                 trot_support = 3.0
                 swing_contact = 3.0
-                reference_traj = 1.0
+                reference_traj = 3.0
                 tracking_base_height = 4.0
-                hip_splay = 1.0
+                hip_splay = 0.5
 
             class termination_weight:
                 termination = 0.01

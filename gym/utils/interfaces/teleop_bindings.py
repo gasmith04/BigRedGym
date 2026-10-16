@@ -79,6 +79,17 @@ class TeleopCommands:
         self.max_vel_yaw = 2.0
         self.increment_yaw = self.max_vel_yaw * 0.2
 
+        if hasattr(env, "command_ranges"):
+            r = env.command_ranges
+            self.max_vel_forward = max(r["lin_vel_x"])
+            self.max_vel_backward = min(r["lin_vel_x"])
+            self.increment_x = (self.max_vel_forward - self.max_vel_backward) * 0.1
+            self.max_vel_sideways = r["lin_vel_y"]
+            self.increment_y = self.max_vel_sideways * 0.2
+            self.max_vel_yaw = r["yaw_vel"]
+            self.increment_yaw = self.max_vel_yaw * 0.2
+
+
         env.commands[:] = 0.0
         env.commands[:, 0] = 1.0  # seed forward velocity so motion is visible
         if hasattr(env.cfg, "commands"):

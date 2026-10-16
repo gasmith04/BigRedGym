@@ -63,6 +63,7 @@ class Go2Trot(LeggedRobot):
         self.gait_reference[:] = (
             self._gait_joint_offsets
             + self._gait_joint_amplitudes * torch.sin(joint_phase)
+            + self._height_posture_offset()
         )
 
     def _leg_phases(self):
@@ -205,7 +206,7 @@ class Go2Trot(LeggedRobot):
         """Penalize non-flat base orientation"""
         error = (
             torch.square(self.projected_gravity[:, :2])
-            / 0.05
+            / 0.1
         )
         return torch.sum(torch.exp(-error), dim=1)
     def _reward_hip_splay(self):
@@ -220,6 +221,24 @@ class Go2Trot(LeggedRobot):
         error /= self.scales["base_height"]
         error = torch.clamp(error, max=0, min=None).flatten()
         return self._sqrdexp(error)
+
+    def _height_posture_offset(self):
+        """Offset for thigh and calf from default,
+        puts the base at base_height_target.
+        Two-link leg IK (thigh = calf = L), keeping each foot at its default
+        fore-aft position under the hip and zero at the default stance height.
+        """
+        L, x0, d0, h0 = 0.213, -0.0915, 0.3183, 0.33  #default foot pos & nominal height
+        d = (d0 + self.base_height_target - h0).clamp(0.12, 0.40)
+        r = torch.sqrt(x0**2 + d.square())
+        half_knee = torch.acos((r / (2 * L)).clamp(max=1.0))
+        thigh = torch.atan2(torch.full_like(d, -x0), d) + half_knee
+        calf = -2.0 * half_knee
+        offset = torch.zeros_like(self.gait_reference)
+        offset[:, 1::3] = thigh - self.default_dof_pos[:, 1:2]
+        offset[:, 2::3] = calf - self.default_dof_pos[:, 2:3]
+        return offset
+
 
     def _reward_tracking_base_height(self):
         """Track the commanded base height"""

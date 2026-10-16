@@ -57,6 +57,7 @@ class CommandVisualizer:
         self.yaw_radius = yaw_radius
         self.yaw_arc_scale = yaw_arc_scale
         self.arc_segments_per_rad = arc_segments_per_rad
+        self.height_scale = height_scale
         # Only the CPU MuJoCo backend has an interactive passive viewer (and the
         # overlay hook).  warp is headless-only (render() is a no-op, no _datas);
         # attaching there would crash, so no-op instead — play on --device cpu to

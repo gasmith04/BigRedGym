@@ -17,6 +17,8 @@ import mujoco
 _FORWARD_RGBA = np.array([1.0, 0.30, 0.30, 1.0], dtype=np.float32)
 _STRAFE_RGBA = np.array([0.30, 0.85, 0.35, 1.0], dtype=np.float32)
 _YAW_RGBA = np.array([0.25, 0.55, 1.0, 1.0], dtype=np.float32)
+_HEIGHT_RGBA = np.array([0.75, 0.35, 0.95, 1.0], dtype=np.float32)  # purple
+
 
 
 def _add_connector(viewer, geom_type, width, start, end, rgba):
@@ -46,6 +48,7 @@ class CommandVisualizer:
         yaw_radius=0.18,
         yaw_arc_scale=0.5,
         arc_segments_per_rad=12,
+        height_scale = 3.0,
     ):
         self.env = env
         self.scale = scale
@@ -54,6 +57,7 @@ class CommandVisualizer:
         self.yaw_radius = yaw_radius
         self.yaw_arc_scale = yaw_arc_scale
         self.arc_segments_per_rad = arc_segments_per_rad
+        self.height_scale = height_scale
         # Only the CPU MuJoCo backend has an interactive passive viewer (and the
         # overlay hook).  warp is headless-only (render() is a no-op, no _datas);
         # attaching there would crash, so no-op instead — play on --device cpu to
@@ -104,6 +108,21 @@ class CommandVisualizer:
 
         if abs(yaw_rate) > 1e-4:
             self._draw_yaw_arc(viewer, anchor, yaw, yaw_rate)
+
+        if hasattr(self.env, "base_height_target"):
+            low, high = self.env.command_ranges["base_height"]
+            dz = float(self.env.base_height_target[0, 0]) - 0.5 * (low + high)
+            if abs(dz) > 1e-4:
+                end = anchor + np.array([0.0, 0.0, dz * self.height_scale])
+                _add_connector(
+                    viewer,
+                    mujoco.mjtGeom.mjGEOM_ARROW,
+                    self.shaft_radius,
+                    anchor,
+                    end,
+                    _HEIGHT_RGBA,
+                )
+
 
     def _draw_yaw_arc(self, viewer, center, robot_yaw, yaw_rate):
         # Arc sweeps the heading change after yaw_arc_scale seconds, clamped

@@ -65,7 +65,7 @@ class Go2TrotCfg(Go2Cfg):
             lin_vel_x = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.75, 2.5]
             lin_vel_y = 0.5
             yaw_vel = 1.5
-            base_height = [0.18, 0.35]
+            base_height = [0.18, 0.38]
             #test these numbers and expand the range if everything works
 
     class push_robots(Go2Cfg.push_robots):

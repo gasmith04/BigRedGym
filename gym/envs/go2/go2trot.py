@@ -65,11 +65,22 @@ class Go2Trot(LeggedRobot):
             + self._gait_joint_amplitudes * torch.sin(joint_phase)
             + self._height_posture_offset()
         )
+        default = self.default_dof_pos.index_select(1, self.actuated_dof_indices)
+        lower = self._actuated_dof_pos_limits[:, 0] + 0.05 - default
+        upper = self._actuated_dof_pos_limits[:, 1] - 0.05 - default
+        self.gait_reference[:] = torch.clamp(self.gait_reference, min=lower, max=upper)
+
 
     def _leg_phases(self):
         return torch.remainder(
             self.phase + self._gait_phase_offsets.unsqueeze(0), 2 * torch.pi
         )
+    def _speed_scale(self):
+        """1 up to nominal height then shrink linearly to 0.4 at max height"""
+        h0 = 0.33
+        h_max = self.command_ranges["base_height"][1]
+        frac = ((self.base_height_target - h0) / (h_max - h0)).clamp(0.0, 1.0)
+        return 1.0 - 0.6 * frac  # shape (num_envs, 1)
 
     def _expected_stance(self):
         return torch.sin(self._leg_phases()) > 0
@@ -128,6 +139,7 @@ class Go2Trot(LeggedRobot):
             device=self.device,
         )
         masked_update(self.base_height_target, height, command_mask)
+        masked_update(self.commands, self.commands * self._speed_scale(), command_mask)
 
     def _reset_idx(self, reset_mask):
         super()._reset_idx(reset_mask)

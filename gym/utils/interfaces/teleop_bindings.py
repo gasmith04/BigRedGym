@@ -131,11 +131,22 @@ class TeleopCommands:
                 h[:] = torch.clamp(h - self.increment_height, min=self.min_height)
                 print(f"base height target: {h[0].item():.3f} m")
 
+        if hasattr(self.env, "_speed_scale"):
+            s = self.env._speed_scale()[:, 0]
+            limits = [
+                (self.max_vel_backward, self.max_vel_forward),
+                (-self.max_vel_sideways, self.max_vel_sideways),
+                (-self.max_vel_yaw, self.max_vel_yaw),
+            ]
+            for i, (lo, hi) in enumerate(limits):
+                c[:, i] = torch.clamp(c[:, i], min=lo * s, max=hi * s)
+
         elif action == "reset":
             self.env.timed_out[:] = True
             self.env.reset()
         else:
             raise ValueError(f"unknown teleop action {action!r}")
+
 
     def print_help(self, viewer_name: str) -> None:
         print("______________________________________________________________")

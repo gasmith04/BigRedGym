@@ -53,7 +53,7 @@ HELP_LINES = (
     "  I/K           forward / back",
     "  J/L           strafe left / strafe right",
     "  N/M           yaw left / yaw right",
-    "  Up/Down       up / down (command effects: student TODO)",
+    "  Up/Down       stand up / crouch down",
     "  R             reset envs",
     "  Esc / window  quit",
     "  commands step in 1/5 increments of max",
@@ -79,10 +79,28 @@ class TeleopCommands:
         self.max_vel_yaw = 2.0
         self.increment_yaw = self.max_vel_yaw * 0.2
 
+        if hasattr(env, "command_ranges"):
+            r = env.command_ranges
+            self.max_vel_forward = max(r["lin_vel_x"])
+            self.max_vel_backward = min(r["lin_vel_x"])
+            self.increment_x = (self.max_vel_forward - self.max_vel_backward) * 0.1
+            self.max_vel_sideways = r["lin_vel_y"]
+            self.increment_y = self.max_vel_sideways * 0.2
+            self.max_vel_yaw = r["yaw_vel"]
+            self.increment_yaw = self.max_vel_yaw * 0.2
+
+
         env.commands[:] = 0.0
         env.commands[:, 0] = 1.0  # seed forward velocity so motion is visible
         if hasattr(env.cfg, "commands"):
             env.cfg.commands.resampling_time = env.max_episode_length_s + 1
+
+        self.has_height = hasattr(env, "base_height_target")
+        if self.has_height:
+            self.min_height, self.max_height = env.command_ranges["base_height"]
+            self.increment_height = (self.max_height - self.min_height) * 0.1
+            env.base_height_target[:] = 0.5 * (self.min_height + self.max_height)
+
 
     def apply(self, action: str) -> None:
         """Apply one discrete press of ``action`` (see BINDINGS)."""
@@ -101,11 +119,34 @@ class TeleopCommands:
             c[:, 2] = torch.clamp(c[:, 2] + self.increment_yaw, max=self.max_vel_yaw)
         elif action == "yaw_right":
             c[:, 2] = torch.clamp(c[:, 2] - self.increment_yaw, min=-self.max_vel_yaw)
+
+        elif action == "up":
+            if self.has_height:
+                h = self.env.base_height_target
+                h[:] = torch.clamp(h + self.increment_height, max=self.max_height)
+                print(f"base height target: {h[0].item():.3f} m")
+        elif action == "down":
+            if self.has_height:
+                h = self.env.base_height_target
+                h[:] = torch.clamp(h - self.increment_height, min=self.min_height)
+                print(f"base height target: {h[0].item():.3f} m")
+
+        if hasattr(self.env, "_speed_scale"):
+            s = self.env._speed_scale()[:, 0]
+            limits = [
+                (self.max_vel_backward, self.max_vel_forward),
+                (-self.max_vel_sideways, self.max_vel_sideways),
+                (-self.max_vel_yaw, self.max_vel_yaw),
+            ]
+            for i, (lo, hi) in enumerate(limits):
+                c[:, i] = torch.clamp(c[:, i], min=lo * s, max=hi * s)
+
         elif action == "reset":
             self.env.timed_out[:] = True
             self.env.reset()
         else:
             raise ValueError(f"unknown teleop action {action!r}")
+
 
     def print_help(self, viewer_name: str) -> None:
         print("______________________________________________________________")

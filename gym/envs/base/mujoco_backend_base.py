@@ -58,6 +58,9 @@ class MuJocoBackendBase(SimBackend):
         self._qvel_offset: int = 0
         # Native index of the welded payload body, or None when disabled.
         self._payload_body_id: int | None = None
+        self._payload_size: list[float] = None
+        self._payload_mass_t: torch.Tensor = None
+        self._payload_com_t: torch.Tensor = None
 
         # Contact body indices (set by setup)
         self._penalised_contact_indices: torch.Tensor = None
@@ -113,6 +116,36 @@ class MuJocoBackendBase(SimBackend):
     @property
     def link_mass(self) -> torch.Tensor:
         return self._link_mass_t
+
+    @property
+    def payload_mass(self) -> torch.Tensor:
+        return self._payload_mass_t
+
+    @property
+    def payload_com(self) -> torch.Tensor:
+        return self._payload_com_t
+
+    def _prepare_native_payload_update(
+        self,
+        env_ids: torch.Tensor,
+        masses: torch.Tensor,
+        coms: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Validate, record, and return (ids, masses, coms, inertias).
+
+        Returns ``None`` when there is nothing to apply.
+        """
+        ids, mass_values, com_values = self._prepare_payload_update(
+            env_ids, masses, coms
+        )
+        if ids.numel() == 0:
+            return None
+        if self._payload_body_id is None:
+            raise RuntimeError("payload was not enabled before setup")
+        inertias = payload_box_inertia(mass_values, self._payload_size)
+        self._payload_mass_t[ids] = mass_values
+        self._payload_com_t[ids] = com_values
+        return ids, mass_values, com_values, inertias
 
     @property
     def link_inertia(self) -> torch.Tensor:
@@ -247,8 +280,7 @@ class MuJocoBackendBase(SimBackend):
 
         return mjm
 
-    @staticmethod
-    def _add_payload_body(spec: "mujoco.MjSpec", cfg) -> None:
+    def _add_payload_body(self, spec: "mujoco.MjSpec", cfg) -> None:
         """Weld a box payload to the root link.
 
         The body frame coincides with the root link so per-episode COM
@@ -260,6 +292,7 @@ class MuJocoBackendBase(SimBackend):
         mount_pos = [float(v) for v in payload_cfg.mount_pos]
         size = [float(v) for v in payload_cfg.size]
         mass = payload_mass_range(cfg)[0]
+        self._payload_size = size
 
         body = spec.worldbody.first_body().add_body()
         body.name = PAYLOAD_BODY_NAME
@@ -293,6 +326,15 @@ class MuJocoBackendBase(SimBackend):
         ).unsqueeze(0)
         self._link_mass_t = self._nominal_link_mass.repeat(num_envs, 1)
         self._link_inertia_t = self._nominal_link_inertia.repeat(num_envs, 1, 1)
+
+        self._payload_mass_t = torch.zeros(num_envs, device=device)
+        self._payload_com_t = torch.zeros(num_envs, 3, device=device)
+        if self._payload_body_id is not None:
+            body = self._payload_body_id
+            self._payload_mass_t[:] = float(mjm.body_mass[body])
+            self._payload_com_t[:] = torch.tensor(
+                mjm.body_ipos[body], dtype=torch.float, device=device
+            )
 
     @staticmethod
     def _set_model_contact_friction(model: mujoco.MjModel, coefficient: float) -> None:

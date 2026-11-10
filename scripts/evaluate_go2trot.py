@@ -184,7 +184,8 @@ def evaluate(env, runner, *, replicas=4, seconds=8.0, warmup=2.0):
             "body_weight",
         )
     }
-    body_weight = env._backend.link_mass.sum(dim=1) * 9.81
+    total_mass = env._backend.link_mass.sum(dim=1) + env._backend.payload_mass
+    body_weight = total_mass * 9.81
     for _ in range(round(seconds / env.dt)):
         # Pin commands even when the task's periodic sampler fires.
         env.commands[:] = commands

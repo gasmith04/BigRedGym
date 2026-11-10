@@ -283,3 +283,57 @@ def test_go2trot_task_resamples_payload_only_for_reset_envs():
         assert torch.isfinite(env.root_states).all()
     finally:
         env._backend.close()
+
+
+def test_go2trot_payload_observation_is_critic_only_and_tracks_resets():
+    from gym.envs.go2.go2trot_config import Go2TrotRunnerCfg
+
+    runner_cfg = Go2TrotRunnerCfg()
+    assert "payload_obs" in runner_cfg.critic.obs
+    assert "payload_obs" not in runner_cfg.actor.obs
+
+    env = _build_go2trot_task()
+    try:
+        backend = env._backend
+        mount = torch.tensor(env.cfg.domain_randomization.payload.mount_pos)
+
+        def assert_matches_backend():
+            torch.testing.assert_close(env.payload_obs[:, 0], backend.payload_mass)
+            torch.testing.assert_close(
+                env.payload_obs[:, 1:], backend.payload_com - mount
+            )
+
+        assert_matches_backend()
+        env._reset_idx(torch.tensor([True, False, True, False]))
+        assert_matches_backend()
+
+        # Scaling maps the configured ranges into [-1, 1].
+        scaled = env.get_state("payload_obs")
+        assert ((scaled >= -1.0 - 1e-6) & (scaled <= 1.0 + 1e-6)).all()
+        assert (scaled[:, 0] >= 0.0).all()
+        critic = env.get_states(runner_cfg.critic.obs)
+        torch.testing.assert_close(critic[:, -4:], scaled)
+    finally:
+        env._backend.close()
+
+
+def test_go2trot_payload_observation_is_zero_when_disabled():
+    from gym.envs.base.domain_randomization import apply_domain_randomization_override
+    from gym.envs.go2.go2trot import Go2Trot
+    from gym.envs.go2.go2trot_config import Go2TrotCfg, Go2TrotRunnerCfg
+    from gym.utils.task_registry import select_backend, task_registry
+
+    cfg = Go2TrotCfg()
+    runner_cfg = Go2TrotRunnerCfg()
+    cfg.env.num_envs = 2
+    cfg.seed = 5
+    apply_domain_randomization_override(cfg, "off")
+    task_registry.convert_frequencies_to_params(cfg, runner_cfg)
+    env = Go2Trot(cfg, "cpu", True, select_backend(cfg, "cpu", "mujoco"))
+    try:
+        assert env._backend._payload_body_id is None
+        torch.testing.assert_close(env.payload_obs, torch.zeros(2, 4))
+        env._reset_idx(torch.ones(2, dtype=torch.bool))
+        torch.testing.assert_close(env.payload_obs, torch.zeros(2, 4))
+    finally:
+        env._backend.close()

@@ -3,6 +3,7 @@ import torch
 from gym.utils.sampling import torch_rand_float
 from gym.utils.sampling import masked_update
 
+from gym.envs.base.domain_randomization import payload_mass_range
 from gym.envs.base.legged_robot import LeggedRobot
 
 
@@ -50,6 +51,17 @@ class Go2Trot(LeggedRobot):
         )
         self.base_height_target = torch.zeros(
             self.num_envs, 1, dtype=torch.float, device=self.device
+        )
+        # Privileged critic observation: [mass, COM offset from mount_pos].
+        # Stays zero when the payload is disabled.
+        self.payload_obs = torch.zeros(
+            self.num_envs, 4, dtype=torch.float, device=self.device
+        )
+        self._payload_enabled = payload_mass_range(self.cfg) is not None
+        self._payload_mount_pos = torch.tensor(
+            self.cfg.domain_randomization.payload.mount_pos,
+            dtype=torch.float,
+            device=self.device,
         )
         self._update_phase_observation()
         self._update_gait_reference()
@@ -151,6 +163,14 @@ class Go2Trot(LeggedRobot):
             reset_mask,
         )
         self._update_phase_observation()
+        self._update_payload_observation()
+
+    def _update_payload_observation(self):
+        """Payloads only change at reset, so refresh the observation there."""
+        if not self._payload_enabled:
+            return
+        self.payload_obs[:, 0] = self._backend.payload_mass
+        self.payload_obs[:, 1:] = self._backend.payload_com - self._payload_mount_pos
 
     def _post_physics_step(self):
         super()._post_physics_step()
@@ -169,10 +189,11 @@ class Go2Trot(LeggedRobot):
         self._update_gait_reference()
 
     def _foot_contact_strength(self):
-        """Map upward foot load smoothly from zero to nominal body-weight."""
+        """Map upward foot load smoothly from zero to robot-plus-payload weight."""
+        total_mass = self._backend.link_mass.sum(dim=1, keepdim=True)
+        total_mass = total_mass + self._backend.payload_mass.unsqueeze(1)
         load = torch.clamp(
-            self.contact_forces[:, self.feet_indices, 2]
-            / (9.81 * self._backend.link_mass.sum(dim=1, keepdim=True)),
+            self.contact_forces[:, self.feet_indices, 2] / (9.81 * total_mass),
             min=0.0,
             max=1.0,
         )

@@ -115,6 +115,8 @@ class Go2TrotCfg(Go2Cfg):
         dof_pos_target = 4 * [0.2, 0.5, 0.5]
         tau_ff = 4 * [23.7, 23.7, 45.43]
         base_height_target = 0.3
+        # [mass kg, COM offset x, y, z m], matching domain_randomization.payload.
+        payload_obs = [5.0, 0.05, 0.02, 0.02]
 
 
 class Go2TrotRunnerCfg(Go2RunnerCfg):
@@ -165,6 +167,7 @@ class Go2TrotRunnerCfg(Go2RunnerCfg):
             "phase_obs",
             "phase_frequency",
             "base_height_target",
+            "payload_obs",
         ]
         normalize_obs = False
 

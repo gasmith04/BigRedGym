@@ -192,6 +192,17 @@ def payload_mass_range(cfg) -> tuple[float, float] | None:
     return low, high
 
 
+def payload_box_inertia(mass: torch.Tensor, size) -> torch.Tensor:
+    """Diagonal inertia [..., 3] of a solid box of *mass* and full *size*."""
+    a, b, c = (float(v) for v in size)
+    extents = torch.tensor(
+        [b * b + c * c, a * a + c * c, a * a + b * b],
+        dtype=mass.dtype,
+        device=mass.device,
+    )
+    return mass.unsqueeze(-1) * extents / 12.0
+
+
 class DomainRandomizer:
     def __init__(self, cfg, backend, device: str) -> None:
         self._backend = backend

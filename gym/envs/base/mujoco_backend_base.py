@@ -13,6 +13,7 @@ import torch
 import mujoco
 
 from gym import GYM_ROOT_DIR
+from gym.envs.base.domain_randomization import payload_box_inertia, payload_mass_range
 from gym.envs.base.robot_layout import RobotLayout
 from gym.envs.base.sim_backend import SimBackend
 from gym.envs.base.urdf_limits import parse_urdf_limits
@@ -21,6 +22,9 @@ from gym.envs.base.urdf_visuals import replace_visuals_from_mjcf
 # Quaternion convention helpers: MuJoCo [w,x,y,z] ↔ task-layer [x,y,z,w]
 WXYZ_TO_XYZW = [1, 2, 3, 0]
 XYZW_TO_WXYZ = [3, 0, 1, 2]
+
+# Native-only body welded to the root link; never part of the canonical layout.
+PAYLOAD_BODY_NAME = "payload"
 
 
 class MuJocoBackendBase(SimBackend):
@@ -52,6 +56,8 @@ class MuJocoBackendBase(SimBackend):
         self._has_free_joint: bool = False
         self._qpos_offset: int = 0
         self._qvel_offset: int = 0
+        # Native index of the welded payload body, or None when disabled.
+        self._payload_body_id: int | None = None
 
         # Contact body indices (set by setup)
         self._penalised_contact_indices: torch.Tensor = None
@@ -134,6 +140,9 @@ class MuJocoBackendBase(SimBackend):
             root_body = spec.worldbody.first_body()
             freejoint = root_body.add_freejoint()
             freejoint.name = "root"
+
+        if payload_mass_range(cfg) is not None:
+            self._add_payload_body(spec, cfg)
 
         if not discard_visual:
             # Menagerie-style viewer defaults
@@ -238,6 +247,37 @@ class MuJocoBackendBase(SimBackend):
 
         return mjm
 
+    @staticmethod
+    def _add_payload_body(spec: "mujoco.MjSpec", cfg) -> None:
+        """Weld a box payload to the root link.
+
+        The body frame coincides with the root link so per-episode COM
+        offsets only move ``body_ipos``; the visual box stays at mount_pos.
+        Nominal inertial values use the low end of the mass range and are
+        overwritten at every episode reset.
+        """
+        payload_cfg = cfg.domain_randomization.payload
+        mount_pos = [float(v) for v in payload_cfg.mount_pos]
+        size = [float(v) for v in payload_cfg.size]
+        mass = payload_mass_range(cfg)[0]
+
+        body = spec.worldbody.first_body().add_body()
+        body.name = PAYLOAD_BODY_NAME
+        body.explicitinertial = True
+        body.mass = mass
+        body.ipos = mount_pos
+        body.inertia = payload_box_inertia(torch.tensor(mass), size).tolist()
+
+        # Visual only for now: no contacts, no mass contribution.
+        geom = body.add_geom()
+        geom.type = mujoco.mjtGeom.mjGEOM_BOX
+        geom.size = [0.5 * v for v in size]
+        geom.pos = mount_pos
+        geom.contype = 0
+        geom.conaffinity = 0
+        geom.mass = 0.0
+        geom.rgba = [0.85, 0.45, 0.1, 1.0]
+
     def _initialize_link_properties(
         self,
         mjm: mujoco.MjModel,
@@ -315,10 +355,15 @@ class MuJocoBackendBase(SimBackend):
 
         self._robot_layout = RobotLayout.from_cfg(cfg)
         world_name = self._native_body_names[0]
+        payload_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, PAYLOAD_BODY_NAME)
+        self._payload_body_id = payload_id if payload_id >= 0 else None
+        allowed_extra = [world_name]
+        if self._payload_body_id is not None:
+            allowed_extra.append(PAYLOAD_BODY_NAME)
         self._robot_layout.validate_native(
             self._native_dof_names,
             self._native_body_names,
-            allowed_extra_body_names=[world_name],
+            allowed_extra_body_names=allowed_extra,
         )
         self._dof_names = list(self._robot_layout.dof_names)
         self._body_names = list(self._robot_layout.body_names)

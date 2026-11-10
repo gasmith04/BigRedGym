@@ -10,6 +10,7 @@ from gym import GYM_ROOT_DIR
 from gym.envs.base.domain_randomization import (
     apply_domain_randomization_override,
     get_domain_randomization_range,
+    payload_mass_range,
 )
 from gym.envs.base.mujoco_config import MuJoCoCfg
 from tests.unit_tests.conftest import vsim_guard
@@ -681,10 +682,11 @@ def test_vsim_task_randomizes_link_mass_only_at_startup():
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
-        ("off", (None, None, None, None)),
-        ("friction-only", ([0.5, 1.0], None, None, None)),
-        ("pd-only", (None, [0.9, 1.1], [0.8, 1.2], None)),
-        ("mass-only", (None, None, None, [0.85, 1.15])),
+        ("off", (None, None, None, None, None)),
+        ("friction-only", ([0.5, 1.0], None, None, None, None)),
+        ("pd-only", (None, [0.9, 1.1], [0.8, 1.2], None, None)),
+        ("mass-only", (None, None, None, [0.85, 1.15], None)),
+        ("payload-only", (None, None, None, None, [0.0, 5.0])),
     ],
 )
 def test_domain_randomization_bundle_override(mode, expected):
@@ -700,6 +702,7 @@ def test_domain_randomization_bundle_override(mode, expected):
                     "d_gains": [0.8, 1.2],
                 }
             ),
+            payload=SimpleNamespace(mass_range=[0.0, 5.0]),
         )
     )
 
@@ -710,4 +713,40 @@ def test_domain_randomization_bundle_override(mode, expected):
         get_domain_randomization_range(cfg, "p_gains"),
         get_domain_randomization_range(cfg, "d_gains"),
         get_domain_randomization_range(cfg, "link_mass_scale_range"),
+        get_domain_randomization_range(cfg, "payload_mass_range"),
     ) == expected
+
+
+def test_domain_randomization_override_without_payload_block():
+    cfg = SimpleNamespace(
+        domain_randomization=SimpleNamespace(
+            startup=SimpleNamespace(
+                contact_friction_range=[0.5, 1.0],
+                link_mass_scale_range=None,
+            ),
+            episode=SimpleNamespace(scale_ranges={}),
+        )
+    )
+
+    apply_domain_randomization_override(cfg, "off")
+
+    assert get_domain_randomization_range(cfg, "payload_mass_range") is None
+    with pytest.raises(ValueError, match="payload_mass_range"):
+        apply_domain_randomization_override(cfg, "payload-only")
+
+
+@pytest.mark.parametrize("values", [[-1.0, 2.0], [3.0, 1.0]])
+def test_payload_mass_range_rejects_invalid_bounds(values):
+    cfg = SimpleNamespace(
+        domain_randomization=SimpleNamespace(payload=SimpleNamespace(mass_range=values))
+    )
+    with pytest.raises(ValueError, match="payload-mass range"):
+        payload_mass_range(cfg)
+
+
+def test_go2trot_payload_config():
+    from gym.envs.go2.go2trot_config import Go2TrotCfg
+    from gym.envs.go2.go2_config import Go2Cfg
+
+    assert payload_mass_range(Go2TrotCfg) == (0.0, 5.0)
+    assert payload_mass_range(Go2Cfg) is None

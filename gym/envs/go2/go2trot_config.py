@@ -82,6 +82,14 @@ class Go2TrotCfg(Go2Cfg):
                 "d_gains": [0.8, 1.2],
             }
 
+        class payload(Go2Cfg.domain_randomization.payload):
+            mass_range = [0.0, 5.0]
+            # Base collision box top is z=0.057; box center sits half its
+            # height above that. Re-measure against the hardware mount.
+            mount_pos = [0.0, 0.0, 0.097]
+            com_offset_range = [[-0.05, 0.05], [-0.02, 0.02], [-0.01, 0.02]]
+            size = [0.2, 0.12, 0.08]
+
     class asset(Go2Cfg.asset):
         file = "{GYM_ROOT_DIR}/resources/robots/" + "go2/urdf/go2.urdf"
         # Use the SDK's OBJ visuals; keep our URDF's complete physical model.

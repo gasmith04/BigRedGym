@@ -18,12 +18,14 @@ DOMAIN_RANDOMIZATION_MODES = (
     "friction-only",
     "pd-only",
     "mass-only",
+    "payload-only",
 )
 
 STARTUP_AXES = (
     "contact_friction_range",
     "link_mass_scale_range",
 )
+PAYLOAD_AXES = ("payload_mass_range",)
 PD_GAIN_TARGETS = ("p_gains", "d_gains")
 
 
@@ -39,6 +41,17 @@ class DomainRandomizationCfg:
         # every episode reset. The task explicitly binds the allowed tensors.
         scale_ranges = {}
 
+    class payload:
+        # Box welded to the base and resampled at every episode reset.
+        # Payload mass in kilograms; ``None`` disables the payload body.
+        mass_range = None
+        # Nominal box center in the base frame [m].
+        mount_pos = [0.0, 0.0, 0.0]
+        # Per-axis uniform COM offset from mount_pos, [[x], [y], [z]] in [m].
+        com_offset_range = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+        # Box dimensions [m], used for the inertia and the visual geom.
+        size = [0.2, 0.12, 0.08]
+
 
 def get_domain_randomization_range(cfg, name: str):
     """Return a startup-axis or episodic tensor scale range."""
@@ -46,6 +59,9 @@ def get_domain_randomization_range(cfg, name: str):
         return cfg.domain_randomization.startup.contact_friction_range
     if name == "link_mass_scale_range":
         return cfg.domain_randomization.startup.link_mass_scale_range
+    if name == "payload_mass_range":
+        payload = getattr(cfg.domain_randomization, "payload", None)
+        return None if payload is None else payload.mass_range
     return cfg.domain_randomization.episode.scale_ranges.get(name)
 
 
@@ -56,6 +72,14 @@ def set_domain_randomization_range(cfg, name: str, values) -> None:
         return
     if name == "link_mass_scale_range":
         cfg.domain_randomization.startup.link_mass_scale_range = values
+        return
+    if name == "payload_mass_range":
+        payload = getattr(cfg.domain_randomization, "payload", None)
+        if payload is None:
+            if values is not None:
+                raise ValueError("config has no domain_randomization.payload block")
+            return
+        payload.mass_range = values
         return
     ranges = dict(cfg.domain_randomization.episode.scale_ranges)
     if values is None:
@@ -77,10 +101,12 @@ def apply_domain_randomization_override(cfg, mode: str) -> None:
         "friction-only": {"contact_friction_range"},
         "pd-only": set(),
         "mass-only": {"link_mass_scale_range"},
+        "payload-only": {"payload_mass_range"},
     }[mode]
     keep_episode = set(PD_GAIN_TARGETS) if mode == "pd-only" else set()
     configured_startup = {
-        name: get_domain_randomization_range(cfg, name) for name in STARTUP_AXES
+        name: get_domain_randomization_range(cfg, name)
+        for name in (*STARTUP_AXES, *PAYLOAD_AXES)
     }
     configured_episode = dict(cfg.domain_randomization.episode.scale_ranges)
     missing = sorted(
@@ -148,6 +174,22 @@ def scale_range(cfg, name: str) -> tuple[float, float] | None:
 def link_mass_scale_range(cfg) -> tuple[float, float] | None:
     """Return the multiplicative link mass-and-inertia scale range."""
     return scale_range(cfg, "link_mass_scale_range")
+
+
+def payload_mass_range(cfg) -> tuple[float, float] | None:
+    """Return and validate the payload mass range in kilograms.
+
+    ``None`` disables the payload body entirely.
+    """
+    values = _configured_range(cfg, "payload_mass_range")
+    if values is None:
+        return None
+    low, high = values
+    if not 0.0 <= low <= high:
+        raise ValueError(
+            f"payload-mass range must satisfy 0 <= low <= high, got [{low}, {high}]"
+        )
+    return low, high
 
 
 class DomainRandomizer:

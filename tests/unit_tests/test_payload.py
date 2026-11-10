@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from gym.envs.base.domain_randomization import payload_box_inertia
+from gym.envs.base.domain_randomization import payload_box_inertia, payload_com_bounds
 from gym.envs.base.mujoco_backend_base import PAYLOAD_BODY_NAME
 
 
@@ -232,3 +232,54 @@ def test_mujoco_warp_payload_is_per_world():
         )
     finally:
         backend.close()
+
+
+def _build_go2trot_task(num_envs=4):
+    from gym.envs.go2.go2trot import Go2Trot
+    from gym.envs.go2.go2trot_config import Go2TrotCfg, Go2TrotRunnerCfg
+    from gym.utils.task_registry import select_backend, task_registry
+
+    cfg = Go2TrotCfg()
+    runner_cfg = Go2TrotRunnerCfg()
+    cfg.env.num_envs = num_envs
+    cfg.seed = 5
+    cfg.push_robots.toggle = False
+    task_registry.convert_frequencies_to_params(cfg, runner_cfg)
+    backend = select_backend(cfg, "cpu", "mujoco")
+    return Go2Trot(cfg, "cpu", True, backend)
+
+
+def test_go2trot_task_resamples_payload_only_for_reset_envs():
+    env = _build_go2trot_task()
+    try:
+        backend = env._backend
+        payload_cfg = env.cfg.domain_randomization.payload
+        low, high = (torch.tensor(v) for v in payload_com_bounds(env.cfg))
+
+        # The initial reset samples every environment.
+        initial_mass = backend.payload_mass.clone()
+        initial_com = backend.payload_com.clone()
+        assert (
+            (initial_mass >= payload_cfg.mass_range[0])
+            & (initial_mass <= payload_cfg.mass_range[1])
+        ).all()
+        assert ((initial_com >= low - 1e-6) & (initial_com <= high + 1e-6)).all()
+        assert initial_mass.unique().numel() == env.num_envs
+
+        mask = torch.tensor([False, True, False, True])
+        env._reset_idx(mask)
+
+        changed = backend.payload_mass != initial_mass
+        assert torch.equal(changed, mask)
+        torch.testing.assert_close(backend.payload_com[~mask], initial_com[~mask])
+        body = backend._payload_body_id
+        for env_id in range(env.num_envs):
+            model = backend._models[env_id]
+            assert model.body_mass[body] == pytest.approx(
+                float(backend.payload_mass[env_id])
+            )
+
+        env.step()
+        assert torch.isfinite(env.root_states).all()
+    finally:
+        env._backend.close()

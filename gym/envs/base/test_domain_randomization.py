@@ -6,6 +6,7 @@ import torch
 from gym.envs.base.domain_randomization import (
     DomainRandomizer,
     contact_friction_range,
+    payload_com_bounds,
     scale_range,
 )
 
@@ -14,18 +15,30 @@ def _cfg(
     contact_friction=(0.5, 1.0),
     episode_ranges=None,
     link_mass=None,
+    payload=None,
     seed=7,
 ):
-    return SimpleNamespace(
-        seed=seed,
-        domain_randomization=SimpleNamespace(
-            startup=SimpleNamespace(
-                contact_friction_range=contact_friction,
-                link_mass_scale_range=link_mass,
-            ),
-            episode=SimpleNamespace(scale_ranges=episode_ranges or {}),
+    dr = SimpleNamespace(
+        startup=SimpleNamespace(
+            contact_friction_range=contact_friction,
+            link_mass_scale_range=link_mass,
         ),
+        episode=SimpleNamespace(scale_ranges=episode_ranges or {}),
     )
+    if payload is not None:
+        dr.payload = payload
+    return SimpleNamespace(seed=seed, domain_randomization=dr)
+
+
+def _payload(mass_range=(0.0, 5.0), **overrides):
+    values = dict(
+        mass_range=mass_range,
+        mount_pos=[0.0, 0.0, 0.1],
+        com_offset_range=[[-0.05, 0.05], [-0.02, 0.02], [0.0, 0.0]],
+        size=[0.2, 0.1, 0.08],
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 class _RecordingBackend:
@@ -34,6 +47,7 @@ class _RecordingBackend:
         self._nominal_link_mass = torch.tensor([[1.0, 2.0, 3.0]])
         self.link_mass = self._nominal_link_mass.repeat(num_envs, 1)
         self.link_mass_updates = []
+        self.payload_updates = []
         self.updates = []
 
     def set_contact_friction(self, env_ids, coefficients):
@@ -47,6 +61,9 @@ class _RecordingBackend:
         scales = scales.clone()
         self.link_mass_updates.append((env_ids, scales))
         self.link_mass[env_ids] = self._nominal_link_mass * scales
+
+    def set_payload(self, env_ids, masses, coms):
+        self.payload_updates.append((env_ids.clone(), masses.clone(), coms.clone()))
 
 
 @pytest.mark.parametrize(
@@ -75,8 +92,10 @@ def test_disabled_randomization_needs_no_seed_or_backend_support():
 
     randomizer.randomize_startup(torch.arange(3))
     randomizer.randomize_episode(torch.ones(3, dtype=torch.bool))
+    randomizer.randomize_payload(torch.ones(3, dtype=torch.bool))
 
     assert backend.updates == []
+    assert backend.payload_updates == []
 
 
 def test_missing_domain_randomization_config_fails():
@@ -261,3 +280,73 @@ def test_link_mass_scales_each_body_once_at_startup():
     torch.testing.assert_close(backend.link_mass, before)
     assert len(backend.link_mass_updates) == 1
     assert torch.unique(randomizer.link_mass_scale[0]).numel() > 1
+
+
+def _payload_randomizer(num_envs=4, seed=7, **payload_overrides):
+    backend = _RecordingBackend(num_envs)
+    cfg = _cfg(contact_friction=None, payload=_payload(**payload_overrides), seed=seed)
+    return DomainRandomizer(cfg, backend, "cpu"), backend
+
+
+def test_payload_samples_selected_envs_within_bounds_in_one_call():
+    randomizer, backend = _payload_randomizer()
+    mask = torch.tensor([False, True, False, True])
+
+    randomizer.randomize_payload(mask)
+
+    assert len(backend.payload_updates) == 1
+    env_ids, masses, coms = backend.payload_updates[0]
+    assert torch.equal(env_ids, torch.tensor([1, 3]))
+    assert ((0.0 <= masses) & (masses <= 5.0)).all()
+    low = torch.tensor([-0.05, -0.02, 0.1])
+    high = torch.tensor([0.05, 0.02, 0.1])
+    assert ((low - 1e-7 <= coms) & (coms <= high + 1e-7)).all()
+    assert not torch.equal(masses[0], masses[1])
+
+
+def test_payload_all_false_mask_skips_backend():
+    randomizer, backend = _payload_randomizer()
+
+    randomizer.randomize_payload(torch.zeros(4, dtype=torch.bool))
+
+    assert backend.payload_updates == []
+
+
+def test_payload_stream_is_seeded_and_independent_of_other_resets():
+    first, first_backend = _payload_randomizer(seed=123)
+    second, second_backend = _payload_randomizer(seed=123)
+
+    first.randomize_payload(torch.tensor([True, False, False, False]))
+    torch.rand(20)  # task-level RNG use must not perturb the DR stream
+    second.randomize_payload(torch.tensor([True, True, True, True]))
+
+    _, first_masses, first_coms = first_backend.payload_updates[0]
+    _, second_masses, second_coms = second_backend.payload_updates[0]
+    assert torch.equal(first_masses[0], second_masses[0])
+    assert torch.equal(first_coms[0], second_coms[0])
+
+
+def test_payload_requires_seed():
+    with pytest.raises(ValueError, match="non-negative"):
+        _payload_randomizer(seed=-1)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"size": [0.2, 0.0, 0.08]}, "size must be positive"),
+        ({"mount_pos": [0.0, 0.1]}, "three entries"),
+        ({"com_offset_range": [[0.0, 0.0], [0.0, 0.0]]}, r"\[\[x\], \[y\], \[z\]\]"),
+        ({"com_offset_range": [[0.1, -0.1], [0.0, 0.0], [0.0, 0.0]]}, "low <= high"),
+    ],
+)
+def test_payload_geometry_is_validated_at_construction(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        _payload_randomizer(**overrides)
+
+
+def test_payload_com_bounds_add_offsets_to_mount():
+    cfg = _cfg(payload=_payload())
+    low, high = payload_com_bounds(cfg)
+    assert low == pytest.approx([-0.05, -0.02, 0.1])
+    assert high == pytest.approx([0.05, 0.02, 0.1])

@@ -192,6 +192,29 @@ def payload_mass_range(cfg) -> tuple[float, float] | None:
     return low, high
 
 
+def payload_com_bounds(cfg) -> tuple[list[float], list[float]]:
+    """Return per-axis [low], [high] payload COM bounds in the root-link frame.
+
+    The COM is sampled uniformly in ``mount_pos + com_offset_range``. Also
+    validates the box size, so a bad payload config fails before backend setup.
+    """
+    payload_cfg = cfg.domain_randomization.payload
+    mount_pos = [float(v) for v in payload_cfg.mount_pos]
+    offsets = [[float(v) for v in axis] for axis in payload_cfg.com_offset_range]
+    size = [float(v) for v in payload_cfg.size]
+    if len(mount_pos) != 3 or len(size) != 3:
+        raise ValueError("payload mount_pos and size must have three entries")
+    if len(offsets) != 3 or any(len(axis) != 2 for axis in offsets):
+        raise ValueError("payload com_offset_range must be [[x], [y], [z]] ranges")
+    if any(low > high for low, high in offsets):
+        raise ValueError(f"payload COM offsets must satisfy low <= high: {offsets}")
+    if any(v <= 0.0 for v in size):
+        raise ValueError(f"payload size must be positive, got {size}")
+    low = [pos + axis[0] for pos, axis in zip(mount_pos, offsets)]
+    high = [pos + axis[1] for pos, axis in zip(mount_pos, offsets)]
+    return low, high
+
+
 def payload_box_inertia(mass: torch.Tensor, size) -> torch.Tensor:
     """Diagonal inertia [..., 3] of a solid box of *mass* and full *size*."""
     a, b, c = (float(v) for v in size)
@@ -209,6 +232,13 @@ class DomainRandomizer:
         self._device = device
         self._contact_friction_range = contact_friction_range(cfg)
         self._link_mass_scale_range = link_mass_scale_range(cfg)
+        self._payload_mass_range = payload_mass_range(cfg)
+        self._payload_com_low = None
+        self._payload_com_high = None
+        if self._payload_mass_range is not None:
+            low, high = payload_com_bounds(cfg)
+            self._payload_com_low = torch.tensor(low, device=device)
+            self._payload_com_high = torch.tensor(high, device=device)
         self._episode_scale_ranges = {}
         for name in cfg.domain_randomization.episode.scale_ranges:
             values = scale_range(cfg, name)
@@ -223,8 +253,10 @@ class DomainRandomizer:
             "link_mass": self._link_mass_scale_range,
         }
         self._generators = {}
-        if any(values is not None for values in ranges.values()) or any(
-            values is not None for values in self._episode_scale_ranges.values()
+        if (
+            any(values is not None for values in ranges.values())
+            or any(values is not None for values in self._episode_scale_ranges.values())
+            or self._payload_mass_range is not None
         ):
             seed = cfg.seed
             if seed < 0:
@@ -243,8 +275,14 @@ class DomainRandomizer:
                     offset = zlib.crc32(f"episode:{name}".encode())
                     generator.manual_seed(seed + offset)
                     self._generators[name] = generator
+            if self._payload_mass_range is not None:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed + zlib.crc32(b"payload"))
+                self._generators["payload"] = generator
 
         self.link_mass_scale = None
+        self._payload_mass_candidates = None
+        self._payload_com_candidates = None
         self._episode_targets = {}
         self._episode_nominals = {}
         self._episode_scales = {}
@@ -326,3 +364,30 @@ class DomainRandomizer:
                 generator=self._generators[name],
             )
             self.set_episode_scale(name, reset_mask, candidate)
+
+    def randomize_payload(self, reset_mask: torch.Tensor) -> None:
+        """Resample payload mass and COM for resetting environments.
+
+        A full candidate is drawn for every environment so each one's stream
+        does not depend on which other environments reset.
+        """
+        if self._payload_mass_range is None:
+            return
+        generator = self._generators["payload"]
+        num_envs = reset_mask.shape[0]
+        if self._payload_mass_candidates is None:
+            self._payload_mass_candidates = torch.empty(num_envs, device=self._device)
+            self._payload_com_candidates = torch.empty(num_envs, 3, device=self._device)
+        masses = self._payload_mass_candidates
+        coms = self._payload_com_candidates
+        masses.uniform_(*self._payload_mass_range, generator=generator)
+        coms.uniform_(generator=generator)
+        coms.mul_(self._payload_com_high - self._payload_com_low).add_(
+            self._payload_com_low
+        )
+
+        env_ids = reset_mask.nonzero(as_tuple=False).flatten()
+        if env_ids.numel() == 0:
+            return
+        # One backend call, so Warp recomputes model constants once per reset.
+        self._backend.set_payload(env_ids, masses[env_ids], coms[env_ids])

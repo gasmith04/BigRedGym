@@ -6,6 +6,10 @@ class Go2PayloadCfg(Go2TrotCfg):
         # Policy stays at 50 Hz; PD and contacts run 4 substeps per action so
         # the policy can't exploit coarse 20 ms physics the robot doesn't have.
         desired_sim_frequency = 200
+        # Reward-only fore-aft thigh sweep [rad] that scales with commanded
+        # speed. 0.6 rad moves the foot about +/-0.17 m, which covers 1.4 m/s
+        # at 2 Hz and 2.1 m/s at 3 Hz.
+        stride_amplitude_max = 0.6
 
     class commands(Go2TrotCfg.commands):
         class ranges(Go2TrotCfg.commands.ranges):

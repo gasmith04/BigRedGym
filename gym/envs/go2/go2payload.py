@@ -53,15 +53,40 @@ class Go2Payload(Go2Trot):
     def _update_gait_reference(self):
         super()._update_gait_reference()
         self.gait_reference += self._height_posture_offset()
+        self.gait_reference += self._stride_offset()
         default = self.default_dof_pos.index_select(1, self.actuated_dof_indices)
         lower = self._actuated_dof_pos_limits[:, 0] + 0.05 - default
         upper = self._actuated_dof_pos_limits[:, 1] - 0.05 - default
         self.gait_reference.clamp_(min=lower, max=upper)
 
+    def _leg_depth(self):
+        """Hip-to-foot height of the nominal pose at the commanded base height."""
+        d0, h0 = 0.3183, 0.33
+        return (d0 + self.base_height_target - h0).clamp(0.12, 0.40)
+
+    def _stride_offset(self):
+        """Thigh sweep that moves stance feet backward at the commanded speed.
+
+        The body travels v / (2f) during half a cycle of stance. A foot moves
+        -depth per radian of thigh, so x = v / (4f) cos(leg phase) needs an
+        amplitude of v / (4 f depth).
+        """
+        offset = torch.zeros_like(self.gait_reference)
+        # Configs saved before the stride existed keep stepping in place.
+        limit = getattr(self.cfg.control, "stride_amplitude_max", 0.0)
+        if limit <= 0.0:
+            return offset
+        amplitude = self.commands[:, :1] / (
+            4 * self.phase_frequency * self._leg_depth()
+        )
+        amplitude = amplitude.clamp(-limit, limit)
+        offset[:, 1::3] = -amplitude * torch.cos(self._leg_phases())
+        return offset
+
     def _height_posture_offset(self):
         """Two-link leg IK used by the reward's height-adjusted gait reference."""
-        leg_length, x0, d0, h0 = 0.213, -0.0915, 0.3183, 0.33
-        depth = (d0 + self.base_height_target - h0).clamp(0.12, 0.40)
+        leg_length, x0 = 0.213, -0.0915
+        depth = self._leg_depth()
         radius = torch.sqrt(x0**2 + depth.square())
         half_knee = torch.acos((radius / (2 * leg_length)).clamp(max=1.0))
         thigh = torch.atan2(torch.full_like(depth, -x0), depth) + half_knee
@@ -70,6 +95,11 @@ class Go2Payload(Go2Trot):
         offset[:, 1::3] = thigh - self.default_dof_pos[:, 1:2]
         offset[:, 2::3] = calf - self.default_dof_pos[:, 2:3]
         return offset
+
+    def _reward_tracking_lin_vel(self):
+        """Absolute planar error, so missing 0.5 m/s costs the same at any speed."""
+        error = (self.commands[:, :2] - self.base_lin_vel[:, :2]).norm(dim=1)
+        return self._sqrdexp(error) - 0.2 * error
 
     def _reward_orientation(self):
         error = self.projected_gravity[:, :2].square() / 0.1

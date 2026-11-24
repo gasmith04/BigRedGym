@@ -32,6 +32,7 @@ import torch
 from gym.envs.base.domain_randomization import (
     contact_friction_range,
     link_mass_scale_range,
+    payload_mass_range,
 )
 from gym.envs.base.robot_layout import RobotLayout
 from gym.envs.base.sim_backend import SimBackend
@@ -106,6 +107,8 @@ class VSimBackend(SimBackend):
         self._contact_friction_t = None
         self._nominal_contact_friction = 1.0
         self._link_mass_t = None
+        self._payload_mass_t: torch.Tensor = None
+        self._payload_com_t: torch.Tensor = None
         self._link_inertia_t = None
         self._nominal_link_mass = None
         self._nominal_link_inertia = None
@@ -180,6 +183,15 @@ class VSimBackend(SimBackend):
     @property
     def link_inertia(self) -> torch.Tensor:
         return self._link_inertia_t
+
+    @property
+    def payload_mass(self) -> torch.Tensor:
+        # The welded payload body is MuJoCo-only; VSim always carries none.
+        return self._payload_mass_t
+
+    @property
+    def payload_com(self) -> torch.Tensor:
+        return self._payload_com_t
 
     def set_contact_friction(
         self,
@@ -259,6 +271,12 @@ class VSimBackend(SimBackend):
     def setup(self, cfg, num_envs: int, device: str, task=None) -> None:
         if not device.startswith("cuda"):
             raise RuntimeError(f"VSimBackend is CUDA-only, got device={device!r}")
+        if payload_mass_range(cfg) is not None:
+            raise RuntimeError(
+                "VSimBackend does not support the payload body; set "
+                "domain_randomization.payload.mass_range = None or use a "
+                "MuJoCo backend"
+            )
         self._randomize_contact_friction = contact_friction_range(cfg) is not None
         self._randomize_link_mass = link_mass_scale_range(cfg) is not None
         self._has_physical_domain_randomization = (
@@ -269,6 +287,8 @@ class VSimBackend(SimBackend):
         self._v = v
         self._device = device
         self._num_envs = num_envs
+        self._payload_mass_t = torch.zeros(num_envs, device=device)
+        self._payload_com_t = torch.zeros(num_envs, 3, device=device)
         terrain = getattr(cfg, "terrain", None)
         self._nominal_contact_friction = float(
             getattr(terrain, "dynamic_friction", 1.0)

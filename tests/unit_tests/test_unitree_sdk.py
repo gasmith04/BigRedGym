@@ -31,6 +31,7 @@ def sdk():
 
     from go2_deploy.deploy_config import DeployConfig
     from go2_deploy.utility import deploy_utility
+    from go2_deploy.utility.import_custom_impl import load_custom_impl
 
     return SimpleNamespace(
         clients=(
@@ -42,7 +43,7 @@ def sdk():
         lowcmd_type=LowCmd_,
         lowstate_type=LowState_,
         crc=CRC(),
-        config=DeployConfig(),
+        config=DeployConfig(load_custom_impl("go2trot")),
         utility=deploy_utility,
     )
 
@@ -54,7 +55,7 @@ def test_sdk_imports_required_channel_and_message_types(sdk):
 
 
 def test_default_lowcmd_has_valid_crc_and_configured_gains(sdk):
-    command = sdk.utility.default_lowcmd()
+    command = sdk.utility.default_lowcmd(sdk.config)
     assert isinstance(command, sdk.lowcmd_type)
     assert command.head == [0xFE, 0xEF]
     assert command.level_flag == 0xFF
@@ -70,9 +71,9 @@ def test_default_lowcmd_has_valid_crc_and_configured_gains(sdk):
 
 
 def test_emergency_lowcmd_has_damping_only_and_fresh_crc(sdk):
-    original = sdk.utility.default_lowcmd()
+    original = sdk.utility.default_lowcmd(sdk.config)
     original_crc = original.crc
-    emergency = sdk.utility.emergency_lowcmd()
+    emergency = sdk.utility.emergency_lowcmd(sdk.config)
     assert emergency is not original
     assert isinstance(emergency, sdk.lowcmd_type)
     for index, motor in enumerate(emergency.motor_cmd):
@@ -85,7 +86,7 @@ def test_emergency_lowcmd_has_damping_only_and_fresh_crc(sdk):
 
 
 def test_crc_detects_a_changed_motor_command(sdk):
-    command = sdk.utility.default_lowcmd()
+    command = sdk.utility.default_lowcmd(sdk.config)
     original_crc = command.crc
     command.motor_cmd[0].q = 0.125
 

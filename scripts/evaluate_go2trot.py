@@ -184,7 +184,8 @@ def evaluate(env, runner, *, replicas=4, seconds=8.0, warmup=2.0):
             "body_weight",
         )
     }
-    body_weight = env._backend.link_mass.sum(dim=1) * 9.81
+    total_mass = env._backend.link_mass.sum(dim=1) + env._backend.payload_mass
+    body_weight = total_mass * 9.81
     for _ in range(round(seconds / env.dt)):
         # Pin commands even when the task's periodic sampler fires.
         env.commands[:] = commands
@@ -235,7 +236,10 @@ def evaluate(env, runner, *, replicas=4, seconds=8.0, warmup=2.0):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment_name", default="go2trot")
+    parser.add_argument(
+        "--task", choices=("go2trot", "go2payload"), default="go2payload"
+    )
+    parser.add_argument("--experiment_name", default=None, help="defaults to --task")
     parser.add_argument("--load_run", required=True)
     parser.add_argument("--checkpoint", type=int, default=-1)
     parser.add_argument("--original_cfg", action="store_true")
@@ -248,13 +252,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    args.experiment_name = args.experiment_name or args.task
     if args.replicas < 1 or args.warmup < 0 or args.seconds - args.warmup < 3:
         parser.error("use positive replicas and at least 3 measured seconds")
     import gym.envs  # noqa: F401
 
     env_cfg, train_cfg = copy.deepcopy(
         task_registry.get_cfgs(
-            "go2trot",
+            args.task,
             original_cfg=args.original_cfg,
             experiment_name=args.experiment_name,
             load_run=args.load_run,
@@ -279,7 +284,7 @@ def main():
             checkpoint=args.checkpoint,
         )
     )
-    env = task_registry.make_env("go2trot", env_cfg, args.device, True, args.backend)
+    env = task_registry.make_env(args.task, env_cfg, args.device, True, args.backend)
     try:
         runner = task_registry.make_alg_runner(env, train_cfg)
         runner.load(path, load_optimizer=False)

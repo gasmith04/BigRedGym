@@ -5,6 +5,7 @@ Usage:
     uv run scripts/play.py --task mini_cheetah --num_envs 8
     uv run scripts/play.py --task mini_cheetah --load_run May08_12-34-56_ \
                            --checkpoint 1500
+    uv run scripts/play.py --task go2payload --payload off    # or --payload 3.0
 
 Supports MuJoCo CPU/Warp and optional VSim checkpoints.
 """
@@ -14,8 +15,34 @@ import random
 
 import torch
 
+from gym.envs.base.domain_randomization import set_domain_randomization_range
 from gym.utils.helpers import set_seed
 from gym.utils.task_registry import task_registry
+
+
+def _payload_arg(value):
+    if value in ("config", "off"):
+        return value
+    try:
+        mass = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f'expected "config", "off" or a mass in kg, got {value!r}'
+        )
+    if mass < 0:
+        raise argparse.ArgumentTypeError(f"payload mass must be >= 0, got {mass}")
+    return mass
+
+
+def apply_payload_override(env_cfg, payload):
+    """Keep the configured payload, remove it, or fix its mass with a centered COM."""
+    if payload == "config":
+        return
+    if payload == "off":
+        set_domain_randomization_range(env_cfg, "payload_mass_range", None)
+        return
+    set_domain_randomization_range(env_cfg, "payload_mass_range", [payload, payload])
+    env_cfg.domain_randomization.payload.com_offset_range = [[0.0, 0.0]] * 3
 
 
 def get_play_args(argv=None):
@@ -46,6 +73,14 @@ def get_play_args(argv=None):
         "--original_cfg",
         action="store_true",
         help="Load environment and runner configs saved with the selected run.",
+    )
+    parser.add_argument(
+        "--payload",
+        type=_payload_arg,
+        default="config",
+        help='"config" keeps the configured payload randomization, "off" removes '
+        "the payload body, and a number fixes the payload mass in kg with its "
+        "COM at the mount (default: config)",
     )
     parser.add_argument("--headless", action="store_true", default=False)
     parser.add_argument(
@@ -88,12 +123,18 @@ def setup(args):
 
     # Play-time overrides — small batch, long episodes, no pushes.
     env_cfg.env.num_envs = args.num_envs
+    apply_payload_override(env_cfg, args.payload)
     env_cfg.env.episode_length_s = 50
     if hasattr(env_cfg, "commands"):
         env_cfg.commands.resampling_time = 9999
     if hasattr(env_cfg, "push_robots"):
         env_cfg.push_robots.toggle = False
     env_cfg.init_state.reset_mode = "reset_to_basic"
+    if hasattr(env_cfg.init_state, "root_vel_range"):
+        # Spawn at rest so resets don't launch the robot.
+        env_cfg.init_state.root_vel_range = [
+            [0.0, 0.0] for _ in env_cfg.init_state.root_vel_range
+        ]
     if hasattr(env_cfg, "viewer"):
         env_cfg.viewer.show_ui = args.viewer_ui
 
@@ -130,9 +171,12 @@ def setup(args):
     return env, runner
 
 
-def play(env, runner):
+def play(env, runner, keyboard=None):
     n_steps = 10 * int(env.max_episode_length)
     for _ in range(n_steps):
+        if keyboard is not None:
+            # Key presses arrive on the viewer thread; apply them between steps.
+            keyboard.apply_pending()
         runner.set_actions(
             runner.actor_cfg["actions"],
             runner.get_inference_actions(),
@@ -157,6 +201,7 @@ if __name__ == "__main__":
                 "WARNING: the MuJoCo warp (GPU) backend has no interactive viewer "
                 "— nothing will render. Use --device cpu for playback."
             )
+        keyboard = None
         if args.keyboard and hasattr(env, "commands") and not args.headless:
             # Each viewer has its own input model: MuJoCo dispatches key
             # events via a callback, vlearn polls key state per frame.
@@ -171,7 +216,7 @@ if __name__ == "__main__":
                     MujocoKeyboardInterface,
                 )
 
-                MujocoKeyboardInterface(env)
+                keyboard = MujocoKeyboardInterface(env)
         if hasattr(env, "commands") and not args.headless:
             # Same indicators, different drawing primitives per viewer.
             if args.backend == "vsim":
@@ -184,4 +229,4 @@ if __name__ == "__main__":
                 from gym.utils.interfaces.CommandVisualizer import CommandVisualizer
 
                 CommandVisualizer(env)
-        play(env, runner)
+        play(env, runner, keyboard)

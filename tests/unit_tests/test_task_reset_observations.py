@@ -9,8 +9,8 @@ import torch
 
 from tests.unit_tests.conftest import vsim_guard
 
-from gym.envs.go2.go2trot import Go2Trot
-from gym.envs.go2.go2trot_config import Go2TrotCfg, Go2TrotRunnerCfg
+from gym.envs.go2.go2payload import Go2Payload
+from gym.envs.go2.go2payload_config import Go2PayloadCfg, Go2PayloadRunnerCfg
 from gym.utils.task_registry import select_backend, task_registry
 
 
@@ -28,8 +28,8 @@ def task(request):
     if device != "cpu" and not torch.cuda.is_available():
         pytest.fail("GPU tests requested but CUDA is not available", pytrace=False)
     torch.manual_seed(7)
-    cfg = Go2TrotCfg()
-    runner_cfg = Go2TrotRunnerCfg()
+    cfg = Go2PayloadCfg()
+    runner_cfg = Go2PayloadRunnerCfg()
     cfg.seed = 7
     cfg.env.num_envs = 4
     cfg.control.ctrl_frequency = 100
@@ -55,7 +55,7 @@ def task(request):
     # Only native root views receive this tolerance; derived caches stay exact.
     root_refresh_atol = 2e-7 if engine == "vsim" else 0.0
     try:
-        yield Go2Trot(cfg, device, True, backend), runner_cfg, root_refresh_atol
+        yield Go2Payload(cfg, device, True, backend), runner_cfg, root_refresh_atol
     finally:
         backend.close()
 
@@ -97,13 +97,17 @@ def test_runner_observations_include_current_gait_phase_and_frequency(task):
             (torch.sin(env.phase), torch.cos(env.phase), env.phase_frequency),
             dim=-1,
         )
+        # Actor matches the deploy obs_vector; the critic also gets payload_obs.
         for names, size in (
             (runner_cfg.actor.obs, 48),
-            (runner_cfg.critic.obs, 52),
+            (runner_cfg.critic.obs, 56),
         ):
             observation = env.get_states(names)
             assert observation.shape == (env.num_envs, size)
-            torch.testing.assert_close(observation[:, -3:], expected)
+            phase = names.index("phase_obs")
+            assert names[phase + 1] == "phase_frequency"
+            start = sum(env.get_state(name).shape[1] for name in names[:phase])
+            torch.testing.assert_close(observation[:, start : start + 3], expected)
         env.step()
 
 

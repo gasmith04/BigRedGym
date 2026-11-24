@@ -272,6 +272,8 @@ class LeggedRobot(BaseTask):
     def _reset_system(self, reset_mask):
         """Reset selected environments."""
         self.domain_randomizer.randomize_episode(reset_mask)
+        # Before the state commit, so the reset forward pass sees the payload.
+        self.domain_randomizer.randomize_payload(reset_mask)
         self._reset_state(reset_mask)
 
         # * start base position shifted in X-Y plane

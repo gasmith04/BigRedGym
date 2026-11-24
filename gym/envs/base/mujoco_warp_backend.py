@@ -28,6 +28,7 @@ import warp as wp
 from gym.envs.base.domain_randomization import (
     contact_friction_range,
     link_mass_scale_range,
+    payload_mass_range,
 )
 from gym.envs.base.mujoco_backend_base import (
     MuJocoBackendBase,
@@ -65,8 +66,10 @@ class MuJocoWarpBackend(MuJocoBackendBase):
         self._pair_friction_t: torch.Tensor = None
         self._randomize_contact_friction = False
         self._randomize_link_mass = False
+        self._randomize_payload = False
         self._body_mass_native_t: torch.Tensor = None
         self._body_inertia_native_t: torch.Tensor = None
+        self._body_ipos_native_t: torch.Tensor = None
 
     # ── State tensors ──────────────────────────────────────────────────────────
 
@@ -184,6 +187,26 @@ class MuJocoWarpBackend(MuJocoBackendBase):
         self._body_mass_native_t[ids[:, None], body_ids[None, :]] = masses
         self._body_inertia_native_t[ids[:, None], body_ids[None, :]] = inertias
 
+        self._recompute_model_constants()
+
+    def set_payload(
+        self,
+        env_ids: torch.Tensor,
+        masses: torch.Tensor,
+        coms: torch.Tensor,
+    ) -> None:
+        update = self._prepare_native_payload_update(env_ids, masses, coms)
+        if update is None:
+            return
+        ids, mass_values, com_values, inertias = update
+        body = self._payload_body_id
+        self._body_mass_native_t[ids, body] = mass_values
+        self._body_ipos_native_t[ids, body] = com_values
+        self._body_inertia_native_t[ids, body] = inertias
+        self._recompute_model_constants()
+
+    def _recompute_model_constants(self) -> None:
+        """Rebuild mass-derived constants for every world, keeping sim state."""
         with self._wp_ctx:
             mjw.set_const(self._m, self._d)
         self._sync_assembled_states()
@@ -195,6 +218,8 @@ class MuJocoWarpBackend(MuJocoBackendBase):
         self._num_envs = num_envs
         self._randomize_contact_friction = contact_friction_range(cfg) is not None
         self._randomize_link_mass = link_mass_scale_range(cfg) is not None
+        self._randomize_payload = payload_mass_range(cfg) is not None
+        per_world_mass = self._randomize_link_mass or self._randomize_payload
 
         wp.init()
         self._wp_ctx = wp.ScopedDevice(device)
@@ -211,7 +236,7 @@ class MuJocoWarpBackend(MuJocoBackendBase):
                 batch_sizes["geom_friction"] = num_envs
                 if mjm.npair:
                     batch_sizes["pair_friction"] = num_envs
-            if self._randomize_link_mass:
+            if per_world_mass:
                 for name in (
                     "body_mass",
                     "body_inertia",
@@ -220,6 +245,8 @@ class MuJocoWarpBackend(MuJocoBackendBase):
                     "dof_invweight0",
                 ):
                     batch_sizes[name] = num_envs
+            if self._randomize_payload:
+                batch_sizes["body_ipos"] = num_envs
             self._m = mjw.put_model(mjm, batch_sizes=batch_sizes or None)
             mjd = mujoco.MjData(mjm)
             # mujoco-warp ignores the legacy mjModel.njmax field; forward it
@@ -242,9 +269,11 @@ class MuJocoWarpBackend(MuJocoBackendBase):
                 self._geom_friction_t = wp.to_torch(self._m.geom_friction)
                 if mjm.npair:
                     self._pair_friction_t = wp.to_torch(self._m.pair_friction)
-            if self._randomize_link_mass:
+            if per_world_mass:
                 self._body_mass_native_t = wp.to_torch(self._m.body_mass)
                 self._body_inertia_native_t = wp.to_torch(self._m.body_inertia)
+            if self._randomize_payload:
+                self._body_ipos_native_t = wp.to_torch(self._m.body_ipos)
 
         # Scratch tensors for assembled state
         self._root_states_t = torch.zeros(num_envs, 13, device=device)

@@ -187,7 +187,7 @@ def _(mo):
 @app.cell
 def _():
     # --- edit, run this cell, then **run the next one** --------------------------
-    TASK = "go2trot"  # go2trot | mini_cheetah | humanoid | pendulum ...
+    TASK = "go2payload"  # go2payload | go2trot | mini_cheetah | humanoid | pendulum ...
     DEVICE = "cuda:0" # specifies which GPU to use - do not edit this line unless you know what this means!
     NUM_ENVS = 4096 # we specify multiples of 2 to compensate for the hardware.
     MAX_ITERATIONS = 550

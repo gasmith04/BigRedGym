@@ -178,7 +178,22 @@ def test_mujoco_callback_registered_and_dispatches():
 
     start = env.commands[0, 0].item()
     ui._on_key(ord(BINDINGS["forward"]))
+    # Queued on the viewer thread; applied only when the step loop drains it.
+    assert env.commands[0, 0].item() == start
+    ui.apply_pending()
     assert env.commands[0, 0].item() == start + ui.commands.increment_x
+
+
+def test_mujoco_reset_waits_for_step_loop():
+    env = FakeEnv()
+    ui = MujocoKeyboardInterface(env)
+    ui._on_key(ord(BINDINGS["reset"]))
+    ui._on_key(ord(BINDINGS["forward"]))
+    assert env.reset_count == 0
+    ui.apply_pending()
+    assert env.reset_count == 1
+    ui.apply_pending()  # queue drained; nothing applied twice
+    assert env.reset_count == 1
 
 
 def test_mujoco_ignores_unbound_keys():
@@ -186,6 +201,7 @@ def test_mujoco_ignores_unbound_keys():
     ui = MujocoKeyboardInterface(env)
     before = env.commands.clone()
     ui._on_key(ord("Z"))  # not bound
+    ui.apply_pending()
     assert torch.equal(env.commands, before)
 
 
@@ -195,6 +211,7 @@ def test_mujoco_arrows_dispatch(keycode, action):
     actions = []
     ui.commands.apply = actions.append
     ui._on_key(keycode)
+    ui.apply_pending()
     assert actions == [action]
 
 
@@ -227,6 +244,67 @@ def test_commands_clamp_at_limits():
     for _ in range(400):
         cmds.apply("back")
     assert env.commands[0, 0].item() >= cmds.max_vel_backward - 1e-6
+
+
+class SpeedScaledEnv(FakeEnv):
+    """Go2Trot-style env whose safe speed shrinks with the height target."""
+
+    def __init__(self, scale=0.5):
+        super().__init__()
+        self.scale = scale
+
+    def _speed_scale(self):
+        return torch.full((self.commands.shape[0], 1), self.scale)
+
+
+def test_speed_scaled_env_still_resets_and_rejects_unknown_actions():
+    env = SpeedScaledEnv()
+    cmds = TeleopCommands(env)
+
+    cmds.apply("reset")
+    assert env.reset_count == 1
+    assert env.timed_out.all()
+    with pytest.raises(ValueError, match="unknown teleop action"):
+        cmds.apply("jump")
+
+
+class HeightEnv(FakeEnv):
+    """Env whose reset resamples commands and height, like LeggedRobot."""
+
+    def __init__(self):
+        super().__init__()
+        self.command_ranges = {
+            "lin_vel_x": [-1.0, 2.5],
+            "lin_vel_y": 0.5,
+            "yaw_vel": 1.5,
+            "base_height": [0.18, 0.38],
+        }
+        self.base_height_target = torch.zeros(self.commands.shape[0], 1)
+
+    def reset(self):
+        super().reset()
+        self.commands[:] = torch.tensor([1.3, -0.4, 0.9])
+        self.base_height_target[:] = 0.21
+
+
+def test_reset_starts_teleop_from_rest():
+    env = HeightEnv()
+    cmds = TeleopCommands(env)
+    cmds.apply("forward")
+    cmds.apply("up")
+
+    cmds.apply("reset")
+    assert env.reset_count == 1
+    assert torch.all(env.commands == 0.0)
+    assert torch.allclose(env.base_height_target, torch.tensor(0.28))
+
+
+def test_speed_scale_caps_commanded_speed():
+    env = SpeedScaledEnv(scale=0.5)
+    cmds = TeleopCommands(env)
+    for _ in range(200):
+        cmds.apply("forward")
+    assert env.commands[0, 0].item() == pytest.approx(0.5 * cmds.max_vel_forward)
 
 
 # ── Viewer UI panels (MuJoCo) ────────────────────────────────────────────
@@ -295,6 +373,8 @@ def test_viewer_launched_with_panels_hidden(monkeypatch):
         return _StubViewer()
 
     monkeypatch.setattr(mujoco.viewer, "launch_passive", fake_launch)
+    # The launch is faked, so macOS's real-viewer mjpython guard does not apply.
+    monkeypatch.setattr(mujoco.viewer, "_MJPYTHON", object(), raising=False)
 
     b = MuJocoCPUBackend()
     b.setup(_pendulum_cfg(show_ui=False), num_envs=1, device="cpu", task=None)

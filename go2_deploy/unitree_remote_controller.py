@@ -2,7 +2,6 @@ import time
 import sys
 import struct
 
-from go2_deploy.deploy_config import DeployConfig
 from go2_deploy.state import State
 
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
@@ -13,7 +12,7 @@ from unitree_sdk2py.core import channel
 
 
 class UnitreeRemoteController:
-    def __init__(self):
+    def __init__(self, cfg):
         # key
         self.Lx = 0
         self.Rx = 0
@@ -38,7 +37,7 @@ class UnitreeRemoteController:
         self.F3 = [0, 0]
         self.Start = [0, 0]
 
-        self.cfg = DeployConfig()
+        self.cfg = cfg
 
         # derived values
         self.lin_vel_x = 0.0
@@ -99,8 +98,8 @@ class UnitreeRemoteController:
         self.lin_vel_x = (
             self.Ly * self.cfg.command_limits["lin_vel_x"]
         )  # forward-backward
-        self.lin_vel_y = self.Lx * self.cfg.command_limits["lin_vel_y"]  # left-right
-        self.yaw_vel = self.Rx * self.cfg.command_limits["yaw_vel"]
+        self.lin_vel_y = -self.Lx * self.cfg.command_limits["lin_vel_y"]  # left-right
+        self.yaw_vel = -self.Rx * self.cfg.command_limits["yaw_vel"]
 
     def parse(self, remoteData):
         self.parse_key(remoteData)
@@ -150,8 +149,8 @@ class RCHandler:
                 return
             # if self.rc.Y == [1, 0]:
             #     self.controller.request_recovery()
-            elif self.rc.B == [1, 0]:
-                self.controller.request_intermediate()
+            # elif self.rc.B == [1, 0]:
+            #    self.controller.request_intermediate()
             elif self.rc.A == [1, 0]:
                 self.controller.request_custom_ctrl()
 
@@ -192,9 +191,14 @@ class RCHandler:
 
 
 class Custom:
-    def __init__(self):
+    def __init__(self, task_name):
         self.low_state = None
-        self.remoteController = UnitreeRemoteController()
+        from go2_deploy.deploy_config import DeployConfig
+        from go2_deploy.utility.import_custom_impl import load_custom_impl
+
+        self.remoteController = UnitreeRemoteController(
+            DeployConfig(load_custom_impl(task_name))
+        )
 
     def Init(self):
         self.lowstate_subscriber = ChannelSubscriber("rt/lf/lowstate", LowState_)
@@ -207,6 +211,8 @@ class Custom:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        sys.exit(f"usage: {sys.argv[0]} <interface> <task_name>")
     print(
         "WARNING: Please ensure there are no obstacles around the robot"
         + "while running this example."
@@ -218,12 +224,9 @@ if __name__ == "__main__":
         "<Verbosity>config</Verbosity>", "<Verbosity>none</Verbosity>"
     )
 
-    if len(sys.argv) > 1:
-        ChannelFactoryInitialize(0, sys.argv[1])
-    else:
-        ChannelFactoryInitialize(0)
+    ChannelFactoryInitialize(0, sys.argv[1])
 
-    custom = Custom()
+    custom = Custom(sys.argv[2])
     custom.Init()
 
     while True:

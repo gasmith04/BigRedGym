@@ -1,9 +1,9 @@
 """Plain MuJoCo (mj_step) backend — no Warp dependency.
 
 Works on any platform (Linux CPU, Mac Apple Silicon). Each environment owns an
-MjData. Models are shared unless link-mass DR requires one compact model per
-environment; physics runs in a Python loop and state is copied numpy→torch
-after each step.
+MjData. Models are shared unless link-mass DR or the payload requires one
+compact model per environment; physics runs in a Python loop and state is
+copied numpy→torch after each step.
 """
 
 import copy
@@ -17,6 +17,7 @@ from gym import GYM_ROOT_DIR
 from gym.envs.base.domain_randomization import (
     contact_friction_range,
     link_mass_scale_range,
+    payload_mass_range,
 )
 from gym.envs.base.mujoco_backend_base import (
     MuJocoBackendBase,
@@ -50,6 +51,7 @@ class MuJocoCPUBackend(MuJocoBackendBase):
         self._render_pending_time = 0.0
         self._randomize_contact_friction = False
         self._randomize_link_mass = False
+        self._randomize_payload = False
         self._models: list[mujoco.MjModel] | None = None
 
     # ── State tensors ──────────────────────────────────────────────────────────
@@ -117,20 +119,45 @@ class MuJocoCPUBackend(MuJocoBackendBase):
         body_indices = self._canonical_to_native_body_np
         for row, env_id in enumerate(ids.tolist()):
             model = self._models[env_id]
-            data = self._datas[env_id]
             model.body_mass[body_indices] = masses[row].cpu().numpy()
             model.body_inertia[body_indices] = inertias[row].cpu().numpy()
+            self._recompute_model_constants(env_id)
 
-            qpos = data.qpos.copy()
-            qvel = data.qvel.copy()
-            warmstart = data.qacc_warmstart.copy()
-            time = data.time
-            mujoco.mj_setConst(model, data)
-            data.qpos[:] = qpos
-            data.qvel[:] = qvel
-            data.time = time
-            mujoco.mj_forward(model, data)
-            data.qacc_warmstart[:] = warmstart
+    def set_payload(
+        self,
+        env_ids: torch.Tensor,
+        masses: torch.Tensor,
+        coms: torch.Tensor,
+    ) -> None:
+        update = self._prepare_native_payload_update(env_ids, masses, coms)
+        if update is None:
+            return
+        ids, mass_values, com_values, inertias = update
+        body = self._payload_body_id
+        mass_np = mass_values.cpu().numpy()
+        com_np = com_values.cpu().numpy()
+        inertia_np = inertias.cpu().numpy()
+        for row, env_id in enumerate(ids.tolist()):
+            model = self._models[env_id]
+            model.body_mass[body] = mass_np[row]
+            model.body_ipos[body] = com_np[row]
+            model.body_inertia[body] = inertia_np[row]
+            self._recompute_model_constants(env_id)
+
+    def _recompute_model_constants(self, env_id: int) -> None:
+        """Rebuild mass-derived constants without disturbing the sim state."""
+        model = self._models[env_id]
+        data = self._datas[env_id]
+        qpos = data.qpos.copy()
+        qvel = data.qvel.copy()
+        warmstart = data.qacc_warmstart.copy()
+        time = data.time
+        mujoco.mj_setConst(model, data)
+        data.qpos[:] = qpos
+        data.qvel[:] = qvel
+        data.time = time
+        mujoco.mj_forward(model, data)
+        data.qacc_warmstart[:] = warmstart
 
     def _activate_domain(self, env_id: int) -> None:
         """Activate one environment's parameters on the shared CPU model."""
@@ -152,6 +179,8 @@ class MuJocoCPUBackend(MuJocoBackendBase):
         self._num_envs = num_envs
         self._randomize_contact_friction = contact_friction_range(cfg) is not None
         self._randomize_link_mass = link_mass_scale_range(cfg) is not None
+        self._randomize_payload = payload_mass_range(cfg) is not None
+        per_env_models = self._randomize_link_mass or self._randomize_payload
         headless = task.headless if task is not None else True
         visual_model = getattr(cfg.asset, "mujoco_visual_model", None)
         visual_model_path = (
@@ -162,7 +191,7 @@ class MuJocoCPUBackend(MuJocoBackendBase):
 
         mjm = self._load_model(
             cfg,
-            discard_visual=self._randomize_link_mass and headless,
+            discard_visual=per_env_models and headless,
             visual_model_path=visual_model_path,
         )
         self._configure_model(mjm, cfg, device)
@@ -192,7 +221,7 @@ class MuJocoCPUBackend(MuJocoBackendBase):
         # Mass changes require environment-specific derived model constants.
         # The headless model has already discarded visual assets, so private
         # copies remain compact. Other serial worlds share one model.
-        if self._randomize_link_mass:
+        if per_env_models:
             self._models = [mjm] + [copy.copy(mjm) for _ in range(num_envs - 1)]
             self._datas = [mujoco.MjData(model) for model in self._models]
         else:

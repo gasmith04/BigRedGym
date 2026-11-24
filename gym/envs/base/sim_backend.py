@@ -199,6 +199,49 @@ class SimBackend(ABC):
             )
         return ids, values
 
+    @property
+    def payload_mass(self) -> torch.Tensor:
+        """[num_envs] applied payload masses in kilograms (zeros when disabled)."""
+        raise NotImplementedError
+
+    @property
+    def payload_com(self) -> torch.Tensor:
+        """[num_envs, 3] applied payload COM in the root-link frame [m]."""
+        raise NotImplementedError
+
+    def set_payload(
+        self,
+        env_ids: torch.Tensor,
+        masses: torch.Tensor,
+        coms: torch.Tensor,
+    ) -> None:
+        """Set the welded payload's mass and COM; inertia follows its box size."""
+        raise NotImplementedError
+
+    def _prepare_payload_update(
+        self,
+        env_ids: torch.Tensor,
+        masses: torch.Tensor,
+        coms: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device).flatten()
+        mass_values = torch.as_tensor(
+            masses, dtype=torch.float, device=self.device
+        ).flatten()
+        com_values = torch.as_tensor(coms, dtype=torch.float, device=self.device)
+        if mass_values.numel() != ids.numel() or com_values.shape != (
+            ids.numel(),
+            3,
+        ):
+            raise ValueError(
+                "one payload mass and 3D COM are required per environment: "
+                f"{ids.numel()} ids vs masses {tuple(mass_values.shape)}, "
+                f"coms {tuple(com_values.shape)}"
+            )
+        if bool((mass_values < 0.0).any()):
+            raise ValueError("payload masses must be non-negative")
+        return ids, mass_values, com_values
+
     # ── Per-step ────────────────────────────────────────────────────────────
 
     @abstractmethod

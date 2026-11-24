@@ -140,3 +140,27 @@ def test_train_and_play_accept_original_cfg_flag():
 
     assert train_args.original_cfg is True
     assert play_args.original_cfg is True
+
+
+def test_play_payload_flag_keeps_removes_or_fixes_the_payload():
+    from gym.envs.base.domain_randomization import payload_mass_range
+    from gym.envs.go2.go2payload_config import Go2PayloadCfg
+    from scripts.play import apply_payload_override
+
+    def configured(flag):
+        cfg = Go2PayloadCfg()
+        args = get_play_args(["--task", "go2payload", "--payload", flag])
+        apply_payload_override(cfg, args.payload)
+        return cfg
+
+    assert payload_mass_range(configured("config")) == (0.0, 5.0)
+    assert payload_mass_range(configured("off")) is None
+    fixed = configured("3")
+    assert payload_mass_range(fixed) == (3.0, 3.0)
+    assert fixed.domain_randomization.payload.com_offset_range == [[0.0, 0.0]] * 3
+
+
+@pytest.mark.parametrize("flag", ["heavy", "-1"])
+def test_play_payload_flag_rejects_bad_values(flag):
+    with pytest.raises(SystemExit):
+        get_play_args(["--task", "go2payload", "--payload", flag])

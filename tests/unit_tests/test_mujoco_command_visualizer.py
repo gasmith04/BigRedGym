@@ -36,3 +36,32 @@ def test_arrows_follow_canonical_root_pose_without_native_simulator_data(monkeyp
     arrows.clear()
     env._backend._viewer_overlay_fn(viewer)
     np.testing.assert_allclose(arrows[0], [[3.0, 2.0, 0.8], [3.6, 2.0, 0.8]])
+
+
+def _payload_env(enabled):
+    env = SimpleNamespace(
+        _backend=SimpleNamespace(
+            _viewer_overlay_fn=None, payload_mass=torch.tensor([2.5, 0.4, 4.8])
+        ),
+        _payload_enabled=enabled,
+        commands=torch.zeros(3, 3),
+        root_states=torch.zeros(3, 13),
+    )
+    env.root_states[:, 6] = 1.0
+    texts = []
+    viewer = SimpleNamespace(user_scn=SimpleNamespace(ngeom=0), set_texts=texts.append)
+    visualizer_module.CommandVisualizer(env)
+    env._backend._viewer_overlay_fn(viewer)
+    return texts
+
+
+def test_viewer_lists_payload_of_robot_zero_and_range():
+    texts = _payload_env(enabled=True)
+    assert len(texts) == 1
+    _, _, labels, values = texts[0]
+    assert labels.splitlines() == ["Payload (robot 0)", "All robots"]
+    assert values.splitlines() == ["2.50 kg", "0.4 - 4.8 kg"]
+
+
+def test_viewer_shows_no_payload_text_when_disabled():
+    assert _payload_env(enabled=False) == []

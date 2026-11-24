@@ -1,7 +1,7 @@
 """Record Go2Trot speed and height traces at fixed payload masses.
 
 Works with checkpoints trained before the payload existed: with
---original_cfg the run's own config is loaded and a payload body is
+--original_cfg the run's own config is loaded and a payload is
 attached to it. Only the actor is used, so critic size does not matter.
 
 Example:
@@ -51,7 +51,7 @@ def record(env, runner, masses, args):
     mount = torch.tensor(
         env.cfg.domain_randomization.payload.mount_pos, device=env.device
     )
-    env._backend.set_payload(ids, mass, mount.expand(n, 3))
+    env.domain_randomizer.set_payload(ids, mass, mount.expand(n, 3))
 
     command = torch.tensor([args.vx, 0.0, 0.0], device=env.device)
     steps = round(args.seconds / env.dt)
@@ -60,7 +60,7 @@ def record(env, runner, masses, args):
     speed, height = [], []
     for i in range(steps):
         if i == step_index:
-            env._backend.set_payload(
+            env.domain_randomizer.set_payload(
                 ids, torch.full_like(mass, args.step_mass), mount.expand(n, 3)
             )
         # Pin commands each step so no sampler can change them.

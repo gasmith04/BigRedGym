@@ -36,7 +36,7 @@ def _go2trot(mode, *, randomized=False):
     cfg.commands.resampling_time = 100.0
     cfg.init_state.reset_mode = "reset_to_basic"
     dr = cfg.domain_randomization
-    # The welded payload body is MuJoCo-only.
+    # Payload DR is covered by test_payload and the payload trajectory regression.
     dr.payload.mass_range = None
     nominal_friction = cfg.terrain.dynamic_friction
     dr.startup.contact_friction_range = (

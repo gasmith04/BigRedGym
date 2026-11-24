@@ -79,7 +79,7 @@ def get_play_args(argv=None):
         type=_payload_arg,
         default="config",
         help='"config" keeps the configured payload randomization, "off" removes '
-        "the payload body, and a number fixes the payload mass in kg with its "
+        "the payload, and a number fixes the payload mass in kg with its "
         "COM at the mount (default: config)",
     )
     parser.add_argument("--headless", action="store_true", default=False)

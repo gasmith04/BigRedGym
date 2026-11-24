@@ -6,7 +6,11 @@ from gym.utils.sampling import masked_update, torch_rand_float
 
 
 class Go2Payload(Go2Trot):
-    """Go2Trot carrying a welded payload resampled every episode."""
+    """Go2Trot carrying a rigidly attached payload resampled every episode.
+
+    Domain randomization folds the payload into the base link's mass
+    properties, so ``link_mass`` already includes it.
+    """
 
     def _init_buffers(self):
         self.base_height_target = torch.zeros(
@@ -90,16 +94,6 @@ class Go2Payload(Go2Trot):
         """Payloads only change at reset, so refresh the observation there."""
         if not self._payload_enabled:
             return
-        self.payload_obs[:, 0] = self._backend.payload_mass
-        self.payload_obs[:, 1:] = self._backend.payload_com - self._payload_mount_pos
-
-    def _foot_contact_strength(self):
-        """Map upward foot load smoothly from zero to robot-plus-payload weight."""
-        total_mass = self._backend.link_mass.sum(dim=1, keepdim=True)
-        total_mass = total_mass + self._backend.payload_mass.unsqueeze(1)
-        load = torch.clamp(
-            self.contact_forces[:, self.feet_indices, 2] / (9.81 * total_mass),
-            min=0.0,
-            max=1.0,
-        )
-        return load.square() * (3.0 - 2.0 * load)
+        randomizer = self.domain_randomizer
+        self.payload_obs[:, 0] = randomizer.payload_mass
+        self.payload_obs[:, 1:] = randomizer.payload_com - self._payload_mount_pos

@@ -16,6 +16,7 @@ gym/wandb
 *.DS_Store
 *.zip
 *.npz
+!tests/unit_tests/data/*.npz
 user/wandb_config.json
 *trajectories/
 

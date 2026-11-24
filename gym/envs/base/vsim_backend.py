@@ -31,8 +31,7 @@ import torch
 
 from gym.envs.base.domain_randomization import (
     contact_friction_range,
-    link_mass_scale_range,
-    payload_mass_range,
+    randomizes_link_inertials,
 )
 from gym.envs.base.robot_layout import RobotLayout
 from gym.envs.base.sim_backend import SimBackend
@@ -101,17 +100,17 @@ class VSimBackend(SimBackend):
         self._render_hooks = []  # each called with the render, per frame
         self._window_closed = False
         self._randomize_contact_friction = False
-        self._randomize_link_mass = False
+        self._randomize_link_inertials = False
         self._has_physical_domain_randomization = False
         self._contact_material_h = None
         self._contact_friction_t = None
         self._nominal_contact_friction = 1.0
+        # Canonical applied mass properties and the engine's native nominals.
         self._link_mass_t = None
-        self._payload_mass_t: torch.Tensor = None
-        self._payload_com_t: torch.Tensor = None
+        self._link_com_t = None
         self._link_inertia_t = None
-        self._nominal_link_mass = None
-        self._nominal_link_inertia = None
+        self._link_inertia_quat_t = None
+        self._nominal_link_inertials_native = None
 
     # ── Metadata ──────────────────────────────────────────────────────────
 
@@ -181,17 +180,16 @@ class VSimBackend(SimBackend):
         return self._link_mass_t
 
     @property
+    def link_com(self) -> torch.Tensor:
+        return self._link_com_t
+
+    @property
     def link_inertia(self) -> torch.Tensor:
         return self._link_inertia_t
 
     @property
-    def payload_mass(self) -> torch.Tensor:
-        # The welded payload body is MuJoCo-only; VSim always carries none.
-        return self._payload_mass_t
-
-    @property
-    def payload_com(self) -> torch.Tensor:
-        return self._payload_com_t
+    def link_inertia_quat(self) -> torch.Tensor:
+        return self._link_inertia_quat_t
 
     def set_contact_friction(
         self,
@@ -212,27 +210,74 @@ class VSimBackend(SimBackend):
         self._property_mask[ids] = True
         self._gym.set_rigid_material_properties(self._friction_set_arr)
 
-    def set_link_mass_scale(
+    def set_link_inertials(
         self,
         env_ids: torch.Tensor,
-        scales: torch.Tensor,
+        masses: torch.Tensor,
+        coms: torch.Tensor,
+        inertias: torch.Tensor,
+        inertia_quats: torch.Tensor,
     ) -> None:
-        ids, values = self._prepare_link_mass_scale_update(env_ids, scales)
+        ids, masses, coms, inertias, quats = self._prepare_link_inertial_update(
+            env_ids, masses, coms, inertias, inertia_quats
+        )
         if ids.numel() == 0:
             return
-        if not self._randomize_link_mass:
-            raise RuntimeError("link-mass randomization was not enabled before setup")
-
-        masses = self._nominal_link_mass * values
-        inertias = self._nominal_link_inertia * values.unsqueeze(-1)
+        if not self._randomize_link_inertials:
+            raise RuntimeError(
+                "link mass-property randomization was not enabled before setup"
+            )
+        # Rewriting an unchanged BODY_TO_MODEL is not bit-neutral in VSim (it
+        # perturbs dynamics like a 1e-7 mass change), so skip it unless a COM
+        # or principal axis moves. Mass scaling then matches no-DR exactly.
+        frame_changed = not (
+            torch.equal(self._link_com_t[ids], coms)
+            and torch.equal(self._link_inertia_quat_t[ids], quats)
+        )
         self._link_mass_t[ids] = masses
+        self._link_com_t[ids] = coms
         self._link_inertia_t[ids] = inertias
-        body_ids = self._canonical_to_native_body
-        self._link_mass_native[ids[:, None], body_ids[None, :]] = masses
-        self._link_inertia_native[ids[:, None], body_ids[None, :]] = inertias
+        self._link_inertia_quat_t[ids] = quats
+        rows, bodies = ids[:, None], self._canonical_to_native_body[None, :]
+        self._link_mass_native[rows, bodies] = masses
+        self._link_inertia_native[rows, bodies] = inertias
+        # BODY_TO_MODEL is the link-to-COM transform [qx, qy, qz, qw, px, py, pz]:
+        # its rotation orients the principal axes in which DIAG_INERTIA is given.
+        self._link_body_to_model_native[rows, bodies, 0:4] = quats
+        self._link_body_to_model_native[rows, bodies, 4:7] = coms
         self._link_property_mask.zero_()
         self._link_property_mask[ids] = True
-        self._gym.set_link_properties(self._link_property_set_arr)
+        mass_array, frame_array, inertia_array = self._link_property_set_arrs
+        self._gym.set_link_properties(mass_array)
+        if frame_changed:
+            self._gym.set_link_properties(frame_array)
+        self._gym.set_link_properties(inertia_array)
+
+    def _read_link_inertials(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Engine values of native link MASS, DIAG_INERTIA, and BODY_TO_MODEL.
+
+        Shapes are [sets, L], [sets, L, 3], and [sets, L, 7]; rows are
+        environment sets, which all hold the asset's nominal values at setup.
+        """
+        v, grp = self._v, self._grp
+        num_sets = grp.get_num_environment_sets()
+        native_l = self._num_native_bodies
+        dev = self._device
+        buffers = {
+            v.LinkProperty.MASS: torch.zeros(num_sets, native_l, device=dev),
+            v.LinkProperty.DIAG_INERTIA: torch.zeros(num_sets, native_l, 3, device=dev),
+            v.LinkProperty.BODY_TO_MODEL: torch.zeros(
+                num_sets, native_l, 7, device=dev
+            ),
+        }
+        commands = [
+            grp.create_link_property_command(
+                prop, v.wrap_gpu_buffer(buffer), self._art_def_h, (0, native_l)
+            )
+            for prop, buffer in buffers.items()
+        ]
+        self._gym.get_link_properties(self._gym.create_gpu_array(commands))
+        return tuple(buffers.values())
 
     @staticmethod
     def _set_contact_offsets(model_def, knobs) -> None:
@@ -271,24 +316,16 @@ class VSimBackend(SimBackend):
     def setup(self, cfg, num_envs: int, device: str, task=None) -> None:
         if not device.startswith("cuda"):
             raise RuntimeError(f"VSimBackend is CUDA-only, got device={device!r}")
-        if payload_mass_range(cfg) is not None:
-            raise RuntimeError(
-                "VSimBackend does not support the payload body; set "
-                "domain_randomization.payload.mass_range = None or use a "
-                "MuJoCo backend"
-            )
         self._randomize_contact_friction = contact_friction_range(cfg) is not None
-        self._randomize_link_mass = link_mass_scale_range(cfg) is not None
+        self._randomize_link_inertials = randomizes_link_inertials(cfg)
         self._has_physical_domain_randomization = (
-            self._randomize_contact_friction or self._randomize_link_mass
+            self._randomize_contact_friction or self._randomize_link_inertials
         )
         import vlearn as v
 
         self._v = v
         self._device = device
         self._num_envs = num_envs
-        self._payload_mass_t = torch.zeros(num_envs, device=device)
-        self._payload_com_t = torch.zeros(num_envs, 3, device=device)
         terrain = getattr(cfg, "terrain", None)
         self._nominal_contact_friction = float(
             getattr(terrain, "dynamic_friction", 1.0)
@@ -443,33 +480,16 @@ class VSimBackend(SimBackend):
         self._canonical_to_native_body = torch.tensor(
             canonical_to_native_body, dtype=torch.long, device=device
         )
-        nominal_mass_native = torch.tensor(
-            [art_def.get_link_def(i).mass for i in range(self._num_native_bodies)],
-            dtype=torch.float,
-            device=device,
+        nominal = tuple(value[0] for value in self._read_link_inertials())
+        self._nominal_link_inertials_native = nominal
+        mass, inertia, body_to_model = (
+            value.index_select(0, self._canonical_to_native_body).unsqueeze(0)
+            for value in nominal
         )
-        nominal_inertia_native = torch.tensor(
-            [
-                [
-                    art_def.get_link_def(i).diag_inertia.x,
-                    art_def.get_link_def(i).diag_inertia.y,
-                    art_def.get_link_def(i).diag_inertia.z,
-                ]
-                for i in range(self._num_native_bodies)
-            ],
-            dtype=torch.float,
-            device=device,
-        )
-        self._nominal_link_mass = nominal_mass_native.index_select(
-            0, self._canonical_to_native_body
-        ).unsqueeze(0)
-        self._nominal_link_inertia = nominal_inertia_native.index_select(
-            0, self._canonical_to_native_body
-        ).unsqueeze(0)
-        self._link_mass_t = self._nominal_link_mass.repeat(num_envs, 1)
-        self._link_inertia_t = self._nominal_link_inertia.repeat(num_envs, 1, 1)
-        self._nominal_link_mass_native = nominal_mass_native
-        self._nominal_link_inertia_native = nominal_inertia_native
+        self._link_mass_t = mass.repeat(num_envs, 1)
+        self._link_inertia_t = inertia.repeat(num_envs, 1, 1)
+        self._link_inertia_quat_t = body_to_model[..., 0:4].repeat(num_envs, 1, 1)
+        self._link_com_t = body_to_model[..., 4:7].repeat(num_envs, 1, 1)
 
         n_motors = art_def.get_num_motor_defs()
         if n_motors != self._num_dof:
@@ -559,29 +579,37 @@ class VSimBackend(SimBackend):
             )
             self._friction_set_arr = gym.create_gpu_array([static_cmd, dynamic_cmd])
 
-        if self._randomize_link_mass:
+        if self._randomize_link_inertials:
             # Link-property masks select environment sets. Physical DR setup
             # uses one environment per set, so set and environment IDs match.
             self._link_property_mask = torch.zeros(N, dtype=torch.bool, device=dev)
-            self._link_mass_native = self._nominal_link_mass_native.repeat(N, 1)
-            self._link_inertia_native = self._nominal_link_inertia_native.repeat(
-                N, 1, 1
-            )
-            mass_cmd = grp.create_link_property_command(
-                v.LinkProperty.MASS,
-                v.wrap_gpu_buffer(self._link_mass_native),
-                self._art_def_h,
-                (0, native_L),
-                masks_buffer=v.wrap_gpu_buffer(self._link_property_mask),
-            )
-            inertia_cmd = grp.create_link_property_command(
-                v.LinkProperty.DIAG_INERTIA,
-                v.wrap_gpu_buffer(self._link_inertia_native),
-                self._art_def_h,
-                (0, native_L),
-                masks_buffer=v.wrap_gpu_buffer(self._link_property_mask),
-            )
-            self._link_property_set_arr = gym.create_gpu_array([mass_cmd, inertia_cmd])
+            mass, inertia, body_to_model = self._nominal_link_inertials_native
+            self._link_mass_native = mass.repeat(N, 1)
+            self._link_inertia_native = inertia.repeat(N, 1, 1)
+            self._link_body_to_model_native = body_to_model.repeat(N, 1, 1)
+            # Setting MASS rescales the stored inertia by the mass ratio, and
+            # setting BODY_TO_MODEL re-expresses it. Applying DIAG_INERTIA last,
+            # in its own call, stores the written moments exactly; one
+            # combined command array did not honor its order (measured with
+            # vlearn 0.3.15).
+            self._link_property_set_arrs = [
+                gym.create_gpu_array(
+                    [
+                        grp.create_link_property_command(
+                            prop,
+                            v.wrap_gpu_buffer(buffer),
+                            self._art_def_h,
+                            (0, native_L),
+                            masks_buffer=v.wrap_gpu_buffer(self._link_property_mask),
+                        )
+                    ]
+                )
+                for prop, buffer in (
+                    (v.LinkProperty.MASS, self._link_mass_native),
+                    (v.LinkProperty.BODY_TO_MODEL, self._link_body_to_model_native),
+                    (v.LinkProperty.DIAG_INERTIA, self._link_inertia_native),
+                )
+            ]
 
         # GET command buffers (contiguous; wrap_gpu_buffer rejects views)
         self._jp_get = torch.zeros(N, nd, device=dev)

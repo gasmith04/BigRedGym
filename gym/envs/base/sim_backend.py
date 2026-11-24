@@ -166,81 +166,82 @@ class SimBackend(ABC):
             )
         return ids, values
 
+    # Link mass properties are canonical-body tensors in each link's frame.
+    # Tasks and evaluation code may cache them, so implementations keep them
+    # persistent. Each reflects the values most recently applied natively.
+
     @property
     def link_mass(self) -> torch.Tensor:
-        """[num_envs, num_bodies] applied robot-link masses in kilograms."""
+        """[num_envs, num_bodies] applied link masses in kilograms.
+
+        Includes any payload that domain randomization attached to a link.
+        """
+        raise NotImplementedError
+
+    @property
+    def link_com(self) -> torch.Tensor:
+        """[num_envs, num_bodies, 3] applied COM positions in the link frame."""
         raise NotImplementedError
 
     @property
     def link_inertia(self) -> torch.Tensor:
-        """[num_envs, num_bodies, 3] applied diagonal link inertias."""
-        raise NotImplementedError
-
-    def set_link_mass_scale(
-        self,
-        env_ids: torch.Tensor,
-        scales: torch.Tensor,
-    ) -> None:
-        """Scale each canonical link's nominal mass and diagonal inertia."""
-        raise NotImplementedError
-
-    def _prepare_link_mass_scale_update(
-        self,
-        env_ids: torch.Tensor,
-        scales: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device).flatten()
-        values = torch.as_tensor(scales, dtype=torch.float, device=self.device)
-        expected = (ids.numel(), self.num_bodies)
-        if values.shape != expected:
-            raise ValueError(
-                "one link-mass scale is required per environment and canonical "
-                f"body: expected {expected}, got {tuple(values.shape)}"
-            )
-        return ids, values
-
-    @property
-    def payload_mass(self) -> torch.Tensor:
-        """[num_envs] applied payload masses in kilograms (zeros when disabled)."""
+        """[num_envs, num_bodies, 3] applied principal moments of inertia."""
         raise NotImplementedError
 
     @property
-    def payload_com(self) -> torch.Tensor:
-        """[num_envs, 3] applied payload COM in the root-link frame [m]."""
+    def link_inertia_quat(self) -> torch.Tensor:
+        """[num_envs, num_bodies, 4] principal-axis orientation in the link frame.
+
+        Scalar-last [x, y, z, w].
+        """
         raise NotImplementedError
 
-    def set_payload(
+    def set_link_inertials(
         self,
         env_ids: torch.Tensor,
         masses: torch.Tensor,
         coms: torch.Tensor,
+        inertias: torch.Tensor,
+        inertia_quats: torch.Tensor,
     ) -> None:
-        """Set the welded payload's mass and COM; inertia follows its box size."""
+        """Replace every canonical link's mass properties in selected envs.
+
+        Shapes are [n, num_bodies] for masses and [n, num_bodies, 3 or 4] for
+        the rest, using the conventions of the matching properties. Only
+        available when ``randomizes_link_inertials(cfg)`` held at setup.
+        """
         raise NotImplementedError
 
-    def _prepare_payload_update(
+    def _prepare_link_inertial_update(
         self,
         env_ids: torch.Tensor,
         masses: torch.Tensor,
         coms: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        inertias: torch.Tensor,
+        inertia_quats: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Move an update to the backend device and validate its shapes."""
         ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device).flatten()
-        mass_values = torch.as_tensor(
-            masses, dtype=torch.float, device=self.device
-        ).flatten()
-        com_values = torch.as_tensor(coms, dtype=torch.float, device=self.device)
-        if mass_values.numel() != ids.numel() or com_values.shape != (
-            ids.numel(),
-            3,
+        n, b = ids.numel(), self.num_bodies
+        values = []
+        for name, value, shape in (
+            ("masses", masses, (n, b)),
+            ("coms", coms, (n, b, 3)),
+            ("inertias", inertias, (n, b, 3)),
+            ("inertia_quats", inertia_quats, (n, b, 4)),
         ):
-            raise ValueError(
-                "one payload mass and 3D COM are required per environment: "
-                f"{ids.numel()} ids vs masses {tuple(mass_values.shape)}, "
-                f"coms {tuple(com_values.shape)}"
-            )
-        if bool((mass_values < 0.0).any()):
-            raise ValueError("payload masses must be non-negative")
-        return ids, mass_values, com_values
+            value = torch.as_tensor(value, dtype=torch.float, device=self.device)
+            if value.shape != shape:
+                raise ValueError(
+                    f"link {name} must have shape {shape} for {n} environments "
+                    f"and {b} canonical bodies, got {tuple(value.shape)}"
+                )
+            if not bool(torch.isfinite(value).all()):
+                raise ValueError(f"link {name} must be finite")
+            values.append(value)
+        if bool((values[0] < 0.0).any()) or bool((values[2] < 0.0).any()):
+            raise ValueError("link masses and inertias must be non-negative")
+        return ids, *values
 
     # ── Per-step ────────────────────────────────────────────────────────────
 

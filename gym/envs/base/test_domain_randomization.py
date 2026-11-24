@@ -5,10 +5,16 @@ import torch
 
 from gym.envs.base.domain_randomization import (
     DomainRandomizer,
+    combine_inertials,
     contact_friction_range,
+    payload_box_inertia,
     payload_com_bounds,
     scale_range,
 )
+from gym.utils.torch_quat import normalize, quat_to_matrix
+
+# Payloads attach to the asset's root link, found from the URDF.
+GO2_URDF = "{GYM_ROOT_DIR}/resources/robots/go2/urdf/go2.urdf"
 
 
 def _cfg(
@@ -27,7 +33,9 @@ def _cfg(
     )
     if payload is not None:
         dr.payload = payload
-    return SimpleNamespace(seed=seed, domain_randomization=dr)
+    return SimpleNamespace(
+        seed=seed, domain_randomization=dr, asset=SimpleNamespace(file=GO2_URDF)
+    )
 
 
 def _payload(mass_range=(0.0, 5.0), **overrides):
@@ -42,12 +50,25 @@ def _payload(mass_range=(0.0, 5.0), **overrides):
 
 
 class _RecordingBackend:
+    # The root link "base" sits second, so root lookup cannot assume index 0.
+    body_names = ["FL_foot", "base", "FL_thigh"]
+    nominal_mass = torch.tensor([[0.1, 6.0, 1.0]])
+    nominal_com = torch.tensor(
+        [[[0.0, 0.0, 0.0], [0.02, 0.0, -0.01], [0.0, 0.0, -0.1]]]
+    )
+    nominal_inertia = torch.tensor([[[1e-4] * 3, [0.02, 0.09, 0.1], [1e-3] * 3]])
+    # Base principal axes yawed by 90 degrees about z.
+    nominal_quat = torch.tensor(
+        [[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.5**0.5, 0.5**0.5], [0.0, 0.0, 0.0, 1.0]]]
+    )
+
     def __init__(self, num_envs):
         self.contact_friction = torch.ones(num_envs)
-        self._nominal_link_mass = torch.tensor([[1.0, 2.0, 3.0]])
-        self.link_mass = self._nominal_link_mass.repeat(num_envs, 1)
-        self.link_mass_updates = []
-        self.payload_updates = []
+        self.link_mass = self.nominal_mass.repeat(num_envs, 1)
+        self.link_com = self.nominal_com.repeat(num_envs, 1, 1)
+        self.link_inertia = self.nominal_inertia.repeat(num_envs, 1, 1)
+        self.link_inertia_quat = self.nominal_quat.repeat(num_envs, 1, 1)
+        self.inertial_updates = []
         self.updates = []
 
     def set_contact_friction(self, env_ids, coefficients):
@@ -56,14 +77,14 @@ class _RecordingBackend:
         self.updates.append((env_ids, coefficients))
         self.contact_friction[env_ids] = coefficients
 
-    def set_link_mass_scale(self, env_ids, scales):
-        env_ids = env_ids.clone()
-        scales = scales.clone()
-        self.link_mass_updates.append((env_ids, scales))
-        self.link_mass[env_ids] = self._nominal_link_mass * scales
-
-    def set_payload(self, env_ids, masses, coms):
-        self.payload_updates.append((env_ids.clone(), masses.clone(), coms.clone()))
+    def set_link_inertials(self, env_ids, masses, coms, inertias, quats):
+        values = tuple(v.clone() for v in (env_ids, masses, coms, inertias, quats))
+        self.inertial_updates.append(values)
+        ids = values[0]
+        self.link_mass[ids] = values[1]
+        self.link_com[ids] = values[2]
+        self.link_inertia[ids] = values[3]
+        self.link_inertia_quat[ids] = values[4]
 
 
 @pytest.mark.parametrize(
@@ -90,12 +111,14 @@ def test_disabled_randomization_needs_no_seed_or_backend_support():
     backend = _RecordingBackend(3)
     randomizer = DomainRandomizer(cfg, backend, "cpu")
 
+    randomizer.bind_link_inertials()
     randomizer.randomize_startup(torch.arange(3))
     randomizer.randomize_episode(torch.ones(3, dtype=torch.bool))
     randomizer.randomize_payload(torch.ones(3, dtype=torch.bool))
 
     assert backend.updates == []
-    assert backend.payload_updates == []
+    assert backend.inertial_updates == []
+    assert randomizer.payload_mass is None
 
 
 def test_missing_domain_randomization_config_fails():
@@ -267,25 +290,38 @@ def test_link_mass_scales_each_body_once_at_startup():
         backend,
         "cpu",
     )
-    randomizer.bind_link_masses()
+    randomizer.bind_link_inertials()
     randomizer.randomize_startup(torch.arange(4))
     before = backend.link_mass.clone()
 
     randomizer.randomize_episode(torch.tensor([False, True, False, True]))
 
+    scale = randomizer.link_mass_scale
+    torch.testing.assert_close(backend.link_mass, backend.nominal_mass * scale)
     torch.testing.assert_close(
-        backend.link_mass,
-        backend._nominal_link_mass * randomizer.link_mass_scale,
+        backend.link_inertia, backend.nominal_inertia * scale.unsqueeze(-1)
+    )
+    # Scaling keeps COMs and principal axes.
+    torch.testing.assert_close(backend.link_com, backend.nominal_com.expand(4, -1, -1))
+    torch.testing.assert_close(
+        backend.link_inertia_quat, backend.nominal_quat.expand(4, -1, -1)
     )
     torch.testing.assert_close(backend.link_mass, before)
-    assert len(backend.link_mass_updates) == 1
-    assert torch.unique(randomizer.link_mass_scale[0]).numel() > 1
+    assert len(backend.inertial_updates) == 1
+    assert torch.unique(scale[0]).numel() > 1
 
 
-def _payload_randomizer(num_envs=4, seed=7, **payload_overrides):
+def _payload_randomizer(num_envs=4, seed=7, link_mass=None, **payload_overrides):
     backend = _RecordingBackend(num_envs)
-    cfg = _cfg(contact_friction=None, payload=_payload(**payload_overrides), seed=seed)
-    return DomainRandomizer(cfg, backend, "cpu"), backend
+    cfg = _cfg(
+        contact_friction=None,
+        link_mass=link_mass,
+        payload=_payload(**payload_overrides),
+        seed=seed,
+    )
+    randomizer = DomainRandomizer(cfg, backend, "cpu")
+    randomizer.bind_link_inertials()
+    return randomizer, backend
 
 
 def test_payload_samples_selected_envs_within_bounds_in_one_call():
@@ -294,14 +330,18 @@ def test_payload_samples_selected_envs_within_bounds_in_one_call():
 
     randomizer.randomize_payload(mask)
 
-    assert len(backend.payload_updates) == 1
-    env_ids, masses, coms = backend.payload_updates[0]
-    assert torch.equal(env_ids, torch.tensor([1, 3]))
-    assert ((0.0 <= masses) & (masses <= 5.0)).all()
+    assert len(backend.inertial_updates) == 1
+    assert torch.equal(backend.inertial_updates[0][0], torch.tensor([1, 3]))
+    masses = randomizer.payload_mass
+    coms = randomizer.payload_com
+    assert ((0.0 <= masses[mask]) & (masses[mask] <= 5.0)).all()
+    assert not torch.equal(masses[1], masses[3])
     low = torch.tensor([-0.05, -0.02, 0.1])
     high = torch.tensor([0.05, 0.02, 0.1])
-    assert ((low - 1e-7 <= coms) & (coms <= high + 1e-7)).all()
-    assert not torch.equal(masses[0], masses[1])
+    assert ((low - 1e-7 <= coms[mask]) & (coms[mask] <= high + 1e-7)).all()
+    # Unselected environments keep no payload at the mount.
+    torch.testing.assert_close(masses[~mask], torch.zeros(2))
+    torch.testing.assert_close(coms[~mask], torch.tensor([[0.0, 0.0, 0.1]] * 2))
 
 
 def test_payload_all_false_mask_skips_backend():
@@ -309,21 +349,130 @@ def test_payload_all_false_mask_skips_backend():
 
     randomizer.randomize_payload(torch.zeros(4, dtype=torch.bool))
 
-    assert backend.payload_updates == []
+    assert backend.inertial_updates == []
 
 
 def test_payload_stream_is_seeded_and_independent_of_other_resets():
-    first, first_backend = _payload_randomizer(seed=123)
-    second, second_backend = _payload_randomizer(seed=123)
+    first, _ = _payload_randomizer(seed=123)
+    second, _ = _payload_randomizer(seed=123)
 
     first.randomize_payload(torch.tensor([True, False, False, False]))
     torch.rand(20)  # task-level RNG use must not perturb the DR stream
     second.randomize_payload(torch.tensor([True, True, True, True]))
 
-    _, first_masses, first_coms = first_backend.payload_updates[0]
-    _, second_masses, second_coms = second_backend.payload_updates[0]
-    assert torch.equal(first_masses[0], second_masses[0])
-    assert torch.equal(first_coms[0], second_coms[0])
+    assert torch.equal(first.payload_mass[0], second.payload_mass[0])
+    assert torch.equal(first.payload_com[0], second.payload_com[0])
+
+
+def test_payload_joins_the_scaled_root_link_only():
+    randomizer, backend = _payload_randomizer(link_mass=(0.8, 1.2))
+    randomizer.randomize_startup(torch.arange(4))
+    randomizer.set_payload(
+        torch.tensor([1, 2]),
+        torch.tensor([3.0, 0.0]),
+        torch.tensor([[0.03, -0.01, 0.12], [0.0, 0.0, 0.1]]),
+    )
+
+    scale = randomizer.link_mass_scale
+    scaled_mass = backend.nominal_mass * scale
+    root = backend.body_names.index("base")
+    others = [i for i in range(3) if i != root]
+    torch.testing.assert_close(backend.link_mass[:, others], scaled_mass[:, others])
+    torch.testing.assert_close(
+        backend.link_mass[:, root], scaled_mass[:, root] + torch.tensor([0, 3.0, 0, 0])
+    )
+    # A massless payload leaves the scaled root link exactly as it was.
+    for env_id in (0, 2, 3):
+        torch.testing.assert_close(
+            backend.link_com[env_id, root], backend.nominal_com[0, root]
+        )
+        torch.testing.assert_close(
+            backend.link_inertia_quat[env_id, root], backend.nominal_quat[0, root]
+        )
+    expected_com = (
+        scaled_mass[1, root] * backend.nominal_com[0, root]
+        + 3.0 * torch.tensor([0.03, -0.01, 0.12])
+    ) / (scaled_mass[1, root] + 3.0)
+    torch.testing.assert_close(backend.link_com[1, root], expected_com)
+
+
+def test_set_payload_validates_inputs_and_enablement():
+    randomizer, backend = _payload_randomizer()
+    with pytest.raises(ValueError, match="one payload mass"):
+        randomizer.set_payload(torch.tensor([0, 1]), torch.ones(1), torch.zeros(2, 3))
+    with pytest.raises(ValueError, match="one payload mass"):
+        randomizer.set_payload(torch.tensor([0]), torch.ones(1), torch.zeros(1, 2))
+    with pytest.raises(ValueError, match="non-negative"):
+        randomizer.set_payload(torch.tensor([0]), -torch.ones(1), torch.zeros(1, 3))
+    # Empty updates are no-ops, matching the other DR setters.
+    randomizer.set_payload(
+        torch.tensor([], dtype=torch.long), torch.zeros(0), torch.zeros(0, 3)
+    )
+    assert backend.inertial_updates == []
+
+    unbound = DomainRandomizer(_cfg(payload=_payload()), _RecordingBackend(2), "cpu")
+    with pytest.raises(RuntimeError, match="bind_link_inertials"):
+        unbound.set_payload(torch.tensor([0]), torch.ones(1), torch.zeros(1, 3))
+    disabled = DomainRandomizer(_cfg(), _RecordingBackend(2), "cpu")
+    with pytest.raises(RuntimeError, match="payload was not enabled"):
+        disabled.set_payload(torch.tensor([0]), torch.ones(1), torch.zeros(1, 3))
+
+
+def _inertia_tensor(inertia, quat):
+    rotation = quat_to_matrix(quat.double())
+    return rotation @ torch.diag_embed(inertia.double()) @ rotation.mT
+
+
+def test_combine_inertials_matches_parallel_axis_theorem():
+    generator = torch.Generator().manual_seed(0)
+    n = 64
+    mass_a = 1.0 + 9.0 * torch.rand(n, generator=generator, dtype=torch.float64)
+    mass_b = 5.0 * torch.rand(n, generator=generator, dtype=torch.float64)
+    com_a = 0.05 * torch.randn(n, 3, generator=generator, dtype=torch.float64)
+    com_b = 0.1 * torch.randn(n, 3, generator=generator, dtype=torch.float64)
+    inertia_a = 0.01 + 0.1 * torch.rand(n, 3, generator=generator, dtype=torch.float64)
+    quat_a = normalize(torch.randn(n, 4, generator=generator, dtype=torch.float64))
+    inertia_b = payload_box_inertia(mass_b, [0.2, 0.12, 0.08])
+
+    mass, com, inertia, quat = combine_inertials(
+        mass_a, com_a, inertia_a, quat_a, mass_b, com_b, inertia_b
+    )
+
+    torch.testing.assert_close(mass, mass_a + mass_b)
+    torch.testing.assert_close(
+        com, (mass_a[:, None] * com_a + mass_b[:, None] * com_b) / mass[:, None]
+    )
+
+    def about(point, body_mass, body_com, tensor):
+        d = body_com - point
+        eye = torch.eye(3, dtype=torch.float64)
+        shift = (d * d).sum(-1)[:, None, None] * eye - d[:, :, None] * d[:, None, :]
+        return tensor + body_mass[:, None, None] * shift
+
+    expected = about(com, mass_a, com_a, _inertia_tensor(inertia_a, quat_a)) + about(
+        com, mass_b, com_b, torch.diag_embed(inertia_b)
+    )
+    torch.testing.assert_close(_inertia_tensor(inertia, quat), expected)
+    torch.testing.assert_close(quat.norm(dim=-1), torch.ones(n, dtype=torch.float64))
+    assert (inertia > 0).all()
+
+
+def test_combine_inertials_keeps_body_unchanged_without_payload():
+    mass_a = torch.tensor([6.9])
+    com_a = torch.tensor([[0.021, 0.0, -0.005]])
+    inertia_a = torch.tensor([[0.0245, 0.0981, 0.107]])
+    quat_a = torch.tensor([[0.0016, 0.0090, -0.0008, 0.99996]])
+    result = combine_inertials(
+        mass_a,
+        com_a,
+        inertia_a,
+        quat_a,
+        torch.zeros(1),
+        torch.ones(1, 3),
+        torch.zeros(1, 3),
+    )
+    for actual, expected in zip(result, (mass_a, com_a, inertia_a, quat_a)):
+        assert torch.equal(actual, expected)
 
 
 def test_payload_requires_seed():

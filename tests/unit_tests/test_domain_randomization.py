@@ -147,9 +147,17 @@ def _assert_link_mass_changes_acceleration(backend):
     pole = backend.body_names.index("pole")
     nominal_mass = backend.link_mass.clone()
     nominal_inertia = backend.link_inertia.clone()
-    scales = torch.ones(2, backend.num_bodies, device=backend.device)
-    scales[1, pole] = 2.0
-    backend.set_link_mass_scale(torch.tensor([0, 1], device=backend.device), scales)
+    masses = nominal_mass.clone()
+    inertias = nominal_inertia.clone()
+    masses[1, pole] *= 2.0
+    inertias[1, pole] *= 2.0
+    backend.set_link_inertials(
+        torch.tensor([0, 1], device=backend.device),
+        masses,
+        backend.link_com.clone(),
+        inertias,
+        backend.link_inertia_quat.clone(),
+    )
 
     torch.testing.assert_close(backend.link_mass[0], nominal_mass[0])
     torch.testing.assert_close(backend.link_mass[1, pole], 2.0 * nominal_mass[1, pole])
@@ -273,13 +281,16 @@ def _assert_task_link_mass_randomization(device, backend_name="mujoco"):
     )
     try:
         scales = env.domain_randomizer.link_mass_scale
+        mass, com, inertia, quat = env.domain_randomizer._nominal_link_inertials
+        torch.testing.assert_close(env._backend.link_mass, mass * scales)
         torch.testing.assert_close(
-            env._backend.link_mass,
-            env._backend._nominal_link_mass * scales,
+            env._backend.link_inertia, inertia * scales.unsqueeze(-1)
         )
+        # Scaling keeps each link's COM and principal axes.
+        backend = env._backend
+        torch.testing.assert_close(backend.link_com, com.expand_as(backend.link_com))
         torch.testing.assert_close(
-            env._backend.link_inertia,
-            env._backend._nominal_link_inertia * scales.unsqueeze(-1),
+            backend.link_inertia_quat, quat.expand_as(backend.link_inertia_quat)
         )
         before_mass = env._backend.link_mass.clone()
         before_inertia = env._backend.link_inertia.clone()
@@ -658,17 +669,14 @@ def test_vsim_link_mass_and_inertia_change_acceleration():
         assert backend._grp.get_num_environments() == [1, 1]
         _assert_link_mass_changes_acceleration(backend)
 
-        backend._link_property_mask.fill_(True)
-        backend._link_mass_native.fill_(float("nan"))
-        backend._link_inertia_native.fill_(float("nan"))
-        backend._gym.get_link_properties(backend._link_property_set_arr)
         body_ids = backend._canonical_to_native_body
-        torch.testing.assert_close(
-            backend._link_mass_native[:, body_ids], backend.link_mass
+        mass, inertia, body_to_model = (
+            value[:, body_ids] for value in backend._read_link_inertials()
         )
-        torch.testing.assert_close(
-            backend._link_inertia_native[:, body_ids], backend.link_inertia
-        )
+        torch.testing.assert_close(mass, backend.link_mass)
+        torch.testing.assert_close(inertia, backend.link_inertia)
+        torch.testing.assert_close(body_to_model[..., 0:4], backend.link_inertia_quat)
+        torch.testing.assert_close(body_to_model[..., 4:7], backend.link_com)
     finally:
         backend.close()
 

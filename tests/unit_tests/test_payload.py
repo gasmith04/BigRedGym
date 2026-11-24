@@ -1,16 +1,21 @@
-"""Welded payload body: model construction and canonical-layout isolation."""
+"""Payload DR: exact folding into the root link, routing, and task wiring.
+
+The payload is a contact-free box rigidly attached to the root link, so the
+DomainRandomizer folds its mass, COM, and inertia into that link and every
+backend applies the result through ``set_link_inertials``. The reference for
+"exact" is MuJoCo itself: a model with the box as a separate welded body.
+"""
 
 import mujoco
 import numpy as np
 import pytest
 import torch
 
-from gym.envs.base.domain_randomization import payload_box_inertia, payload_com_bounds
-from gym.envs.base.mujoco_backend_base import PAYLOAD_BODY_NAME
+from gym import GYM_ROOT_DIR
+from gym.envs.base.domain_randomization import DomainRandomizer, payload_box_inertia
+from tests.unit_tests.conftest import vsim_guard
 
-
-def _payload_id(model):
-    return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, PAYLOAD_BODY_NAME)
+ROOT_LINK = "base"
 
 
 def test_payload_box_inertia_matches_solid_box():
@@ -18,71 +23,6 @@ def test_payload_box_inertia_matches_solid_box():
     torch.testing.assert_close(
         inertia, torch.tensor([[13.0, 10.0, 5.0], [0.0, 0.0, 0.0]])
     )
-
-
-def test_go2payload_payload_body_is_welded_visual_box():
-    from gym.envs.base.mujoco_cpu_backend import MuJocoCPUBackend
-    from gym.envs.go2.go2payload_config import Go2PayloadCfg
-
-    cfg = Go2PayloadCfg()
-    payload_cfg = cfg.domain_randomization.payload
-    model = MuJocoCPUBackend()._load_model(cfg, discard_visual=False)
-    body = _payload_id(model)
-
-    assert body >= 0
-    parent = model.body_parentid[body]
-    assert mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, parent) == "base"
-    # No joint: the payload moves rigidly with the base.
-    assert model.body_jntnum[body] == 0
-    assert model.body_weldid[body] == model.body_weldid[parent]
-
-    mass = payload_cfg.mass_range[0]
-    assert model.body_mass[body] == pytest.approx(mass)
-    np.testing.assert_allclose(model.body_ipos[body], payload_cfg.mount_pos)
-    np.testing.assert_allclose(
-        model.body_inertia[body],
-        payload_box_inertia(torch.tensor(mass), payload_cfg.size).numpy(),
-    )
-
-    geoms = np.flatnonzero(model.geom_bodyid == body)
-    assert len(geoms) == 1
-    geom = geoms[0]
-    assert model.geom_type[geom] == mujoco.mjtGeom.mjGEOM_BOX
-    np.testing.assert_allclose(model.geom_size[geom], 0.5 * np.array(payload_cfg.size))
-    np.testing.assert_allclose(model.geom_pos[geom], payload_cfg.mount_pos)
-    assert model.geom_contype[geom] == 0
-    assert model.geom_conaffinity[geom] == 0
-
-
-def test_payload_stays_out_of_canonical_layout():
-    from gym.envs.base.mujoco_cpu_backend import MuJocoCPUBackend
-    from gym.envs.go2.go2_config import Go2Cfg
-    from gym.envs.go2.go2payload_config import Go2PayloadCfg
-
-    with_payload = MuJocoCPUBackend()
-    with_payload.setup(Go2PayloadCfg(), num_envs=1, device="cpu", task=None)
-    without_payload = MuJocoCPUBackend()
-    without_payload.setup(Go2Cfg(), num_envs=1, device="cpu", task=None)
-    try:
-        assert with_payload._payload_body_id == _payload_id(with_payload._mjm)
-        assert without_payload._payload_body_id is None
-        assert _payload_id(without_payload._mjm) == -1
-        assert with_payload._mjm.nbody == without_payload._mjm.nbody + 1
-
-        assert PAYLOAD_BODY_NAME not in with_payload.body_names
-        assert with_payload.body_names == without_payload.body_names
-        assert with_payload.link_mass.shape == without_payload.link_mass.shape
-        torch.testing.assert_close(
-            with_payload.termination_contact_indices,
-            without_payload.termination_contact_indices,
-        )
-        torch.testing.assert_close(
-            with_payload.penalised_contact_indices,
-            without_payload.penalised_contact_indices,
-        )
-    finally:
-        with_payload.close()
-        without_payload.close()
 
 
 def _go2payload_payload_cfg():
@@ -94,6 +34,160 @@ def _go2payload_payload_cfg():
     cfg.domain_randomization.startup.link_mass_scale_range = None
     cfg.domain_randomization.startup.contact_friction_range = None
     return cfg
+
+
+def _setup(backend, num_envs, device):
+    cfg = _go2payload_payload_cfg()
+    backend.setup(cfg, num_envs=num_envs, device=device, task=None)
+    randomizer = DomainRandomizer(cfg, backend, device)
+    randomizer.bind_link_inertials()
+    return randomizer
+
+
+def _model_inertials(model, body):
+    return [
+        np.array(getattr(model, name)[body])
+        for name in ("body_mass", "body_ipos", "body_inertia", "body_iquat")
+    ]
+
+
+def test_payload_visual_is_massless_and_adds_no_bodies():
+    from gym.envs.base.mujoco_cpu_backend import MuJocoCPUBackend
+    from gym.envs.go2.go2_config import Go2Cfg
+    from gym.envs.go2.go2payload_config import Go2PayloadCfg
+
+    cfg = Go2PayloadCfg()
+    payload_cfg = cfg.domain_randomization.payload
+    with_box = MuJocoCPUBackend()._load_model(cfg, discard_visual=False)
+    headless = MuJocoCPUBackend()._load_model(cfg, discard_visual=True)
+    plain = MuJocoCPUBackend()._load_model(Go2Cfg(), discard_visual=False)
+
+    for model in (with_box, headless):
+        assert model.nbody == plain.nbody
+        for name in ("body_mass", "body_ipos", "body_inertia", "body_iquat"):
+            np.testing.assert_array_equal(getattr(model, name), getattr(plain, name))
+
+    root = mujoco.mj_name2id(with_box, mujoco.mjtObj.mjOBJ_BODY, ROOT_LINK)
+    boxes = [
+        geom
+        for geom in np.flatnonzero(with_box.geom_bodyid == root)
+        if with_box.geom_type[geom] == mujoco.mjtGeom.mjGEOM_BOX
+        and with_box.geom_contype[geom] == 0
+        and with_box.geom_conaffinity[geom] == 0
+    ]
+    assert len(boxes) == 1
+    np.testing.assert_allclose(
+        with_box.geom_size[boxes[0]], 0.5 * np.array(payload_cfg.size)
+    )
+    np.testing.assert_allclose(with_box.geom_pos[boxes[0]], payload_cfg.mount_pos)
+    assert with_box.ngeom == plain.ngeom + 1
+    assert headless.ngeom <= plain.ngeom
+
+
+def _welded_payload_model(cfg, mass, com):
+    """Reference model: the payload as a separate body welded to the root link."""
+    from gym.envs.base.mujoco_backend_base import MuJocoBackendBase
+
+    spec = MuJocoBackendBase._load_urdf_spec(
+        cfg.asset.file.format(GYM_ROOT_DIR=GYM_ROOT_DIR)
+    )
+    spec.compiler.balanceinertia = True
+    spec.compiler.fusestatic = False
+    root = spec.worldbody.first_body()
+    assert root.name == ROOT_LINK
+    root.add_freejoint()
+    body = root.add_body()
+    body.explicitinertial = True
+    body.mass = mass
+    body.ipos = com
+    size = cfg.domain_randomization.payload.size
+    body.inertia = payload_box_inertia(torch.tensor(mass), size).tolist()
+    return spec.compile()
+
+
+def _dynamics(model, qpos, qvel):
+    data = mujoco.MjData(model)
+    data.qpos[:] = qpos
+    data.qvel[:] = qvel
+    mujoco.mj_forward(model, data)
+    mass_matrix = np.zeros((model.nv, model.nv))
+    mujoco.mj_fullM(model, data, mass_matrix)
+    return mass_matrix, data.qfrc_bias.copy()
+
+
+def test_folded_payload_matches_welded_body_dynamics():
+    from gym.envs.base.mujoco_cpu_backend import MuJocoCPUBackend
+
+    backend = MuJocoCPUBackend()
+    randomizer = _setup(backend, num_envs=2, device="cpu")
+    try:
+        payloads = [(5.0, [0.03, -0.01, 0.11]), (2.0, [-0.05, 0.02, 0.09])]
+        randomizer.set_payload(
+            torch.arange(2),
+            torch.tensor([mass for mass, _ in payloads]),
+            torch.tensor([com for _, com in payloads]),
+        )
+        rng = np.random.default_rng(0)
+        for env_id, (mass, com) in enumerate(payloads):
+            folded = backend._models[env_id]
+            welded = _welded_payload_model(_go2payload_payload_cfg(), mass, com)
+            assert folded.nv == welded.nv
+            welded.dof_armature[:] = folded.dof_armature
+            for _ in range(3):
+                qpos = folded.qpos0.copy()
+                quat = rng.normal(size=4)
+                qpos[3:7] = quat / np.linalg.norm(quat)
+                qpos[7:] += rng.uniform(-0.3, 0.3, size=folded.nq - 7)
+                qvel = rng.normal(size=folded.nv)
+                folded_m, folded_bias = _dynamics(folded, qpos, qvel)
+                welded_m, welded_bias = _dynamics(welded, qpos, qvel)
+                # Mass properties pass through float32 tensors.
+                np.testing.assert_allclose(folded_m, welded_m, rtol=1e-5, atol=1e-6)
+                np.testing.assert_allclose(
+                    folded_bias, welded_bias, rtol=1e-5, atol=1e-5
+                )
+    finally:
+        backend.close()
+
+
+def test_mujoco_cpu_payload_changes_only_selected_models():
+    from gym.envs.base.mujoco_cpu_backend import MuJocoCPUBackend
+
+    backend = MuJocoCPUBackend()
+    randomizer = _setup(backend, num_envs=3, device="cpu")
+    try:
+        root = backend._canonical_to_native_body_np[backend.body_names.index(ROOT_LINK)]
+        nominal = [model.body_mass.copy() for model in backend._models]
+        nominal_inertials = _model_inertials(backend._models[0], slice(None))
+        robot_mass = float(backend._models[0].body_subtreemass[root])
+        root_states = backend.root_states.clone()
+
+        masses = torch.tensor([2.0, 5.0])
+        coms = torch.tensor([[0.04, -0.01, 0.09], [-0.05, 0.02, 0.11]])
+        randomizer.set_payload(torch.tensor([1, 2]), masses, coms)
+
+        for actual, expected in zip(
+            _model_inertials(backend._models[0], slice(None)), nominal_inertials
+        ):
+            np.testing.assert_array_equal(actual, expected)
+        for env_id, mass in ((1, 2.0), (2, 5.0)):
+            model = backend._models[env_id]
+            others = np.arange(model.nbody) != root
+            # Updated environments round-trip every link through float32.
+            np.testing.assert_allclose(
+                model.body_mass[others], nominal[env_id][others], rtol=1e-6
+            )
+            assert model.body_mass[root] == pytest.approx(nominal[env_id][root] + mass)
+            assert model.body_subtreemass[root] == pytest.approx(robot_mass + mass)
+        torch.testing.assert_close(
+            backend.link_mass.sum(dim=1),
+            robot_mass + torch.tensor([0.0, 2.0, 5.0]),
+        )
+        torch.testing.assert_close(randomizer.payload_mass, torch.tensor([0, 2.0, 5.0]))
+        # Recomputing model constants must not move the robot.
+        torch.testing.assert_close(backend.root_states, root_states)
+    finally:
+        backend.close()
 
 
 def _drop_and_settle(backend, steps=600):
@@ -110,108 +204,31 @@ def _drop_and_settle(backend, steps=600):
         backend.step(zeros)
 
 
-def _assert_payload_weight_reaches_ground(backend):
-    ids = torch.tensor([1], device=backend.device)
-    backend.set_payload(
-        ids,
+def _assert_payload_weight_reaches_ground(backend, randomizer):
+    robot = backend.link_mass.sum(dim=1).cpu()
+    randomizer.set_payload(
+        torch.tensor([1], device=backend.device),
         torch.tensor([5.0], device=backend.device),
         torch.tensor([[0.03, 0.0, 0.1]], device=backend.device),
     )
+    expected = robot + torch.tensor([0.0, 5.0])
+    torch.testing.assert_close(backend.link_mass.sum(dim=1).cpu(), expected)
+
     _drop_and_settle(backend)
 
     supported = backend.contact_forces[..., 2].sum(dim=1).cpu() / 9.81
-    robot = backend.link_mass.sum(dim=1).cpu()
-    torch.testing.assert_close(
-        supported, robot + torch.tensor([0.0, 5.0]), rtol=1e-3, atol=1e-3
-    )
-
-
-def test_mujoco_cpu_set_payload_updates_selected_models_only():
-    from gym.envs.base.mujoco_cpu_backend import MuJocoCPUBackend
-
-    backend = MuJocoCPUBackend()
-    backend.setup(_go2payload_payload_cfg(), num_envs=3, device="cpu", task=None)
-    try:
-        body = backend._payload_body_id
-        root = backend._mjm.body_parentid[body]
-        robot_mass = float(backend._models[0].body_subtreemass[root])
-        size = backend._payload_size
-        nominal_com = backend.payload_com[0].clone()
-        root_states = backend.root_states.clone()
-
-        masses = torch.tensor([2.0, 5.0])
-        coms = torch.tensor([[0.04, -0.01, 0.09], [-0.05, 0.02, 0.11]])
-        backend.set_payload(torch.tensor([1, 2]), masses, coms)
-
-        torch.testing.assert_close(backend.payload_mass, torch.tensor([0.0, 2.0, 5.0]))
-        torch.testing.assert_close(backend.payload_com[0], nominal_com)
-        torch.testing.assert_close(backend.payload_com[1:], coms)
-        # Recomputing model constants must not move the robot.
-        torch.testing.assert_close(backend.root_states, root_states)
-
-        expected_inertia = payload_box_inertia(
-            torch.cat([torch.zeros(1), masses]), size
-        ).numpy()
-        expected_com = torch.cat([nominal_com[None], coms]).numpy()
-        for env_id, mass in enumerate([0.0, 2.0, 5.0]):
-            model = backend._models[env_id]
-            assert model.body_mass[body] == pytest.approx(mass)
-            np.testing.assert_allclose(
-                model.body_ipos[body], expected_com[env_id], rtol=1e-6
-            )
-            np.testing.assert_allclose(
-                model.body_inertia[body], expected_inertia[env_id], rtol=1e-6
-            )
-            assert model.body_subtreemass[root] == pytest.approx(robot_mass + mass)
-    finally:
-        backend.close()
+    torch.testing.assert_close(supported, expected, rtol=1e-3, atol=1e-3)
 
 
 def test_mujoco_cpu_payload_weight_reaches_ground():
     from gym.envs.base.mujoco_cpu_backend import MuJocoCPUBackend
 
     backend = MuJocoCPUBackend()
-    backend.setup(_go2payload_payload_cfg(), num_envs=2, device="cpu", task=None)
+    randomizer = _setup(backend, num_envs=2, device="cpu")
     try:
-        _assert_payload_weight_reaches_ground(backend)
+        _assert_payload_weight_reaches_ground(backend, randomizer)
     finally:
         backend.close()
-
-
-def test_set_payload_validates_inputs_and_enablement():
-    from gym.envs.base.mujoco_cpu_backend import MuJocoCPUBackend
-    from gym.envs.go2.go2_config import Go2Cfg
-
-    enabled = MuJocoCPUBackend()
-    enabled.setup(_go2payload_payload_cfg(), num_envs=2, device="cpu", task=None)
-    disabled = MuJocoCPUBackend()
-    disabled.setup(Go2Cfg(), num_envs=2, device="cpu", task=None)
-    try:
-        with pytest.raises(ValueError, match="one payload mass"):
-            enabled.set_payload(
-                torch.tensor([0, 1]), torch.tensor([1.0]), torch.zeros(2, 3)
-            )
-        with pytest.raises(ValueError, match="one payload mass"):
-            enabled.set_payload(
-                torch.tensor([0]), torch.tensor([1.0]), torch.zeros(1, 2)
-            )
-        with pytest.raises(ValueError, match="non-negative"):
-            enabled.set_payload(
-                torch.tensor([0]), torch.tensor([-1.0]), torch.zeros(1, 3)
-            )
-
-        torch.testing.assert_close(disabled.payload_mass, torch.zeros(2))
-        with pytest.raises(RuntimeError, match="payload was not enabled"):
-            disabled.set_payload(
-                torch.tensor([0]), torch.tensor([1.0]), torch.zeros(1, 3)
-            )
-        # Empty updates are no-ops, matching the other DR setters.
-        disabled.set_payload(
-            torch.tensor([], dtype=torch.long), torch.zeros(0), torch.zeros(0, 3)
-        )
-    finally:
-        enabled.close()
-        disabled.close()
 
 
 @pytest.mark.warp
@@ -221,15 +238,47 @@ def test_mujoco_warp_payload_is_per_world():
     from gym.envs.base.mujoco_warp_backend import MuJocoWarpBackend
 
     backend = MuJocoWarpBackend()
-    backend.setup(_go2payload_payload_cfg(), num_envs=2, device="cuda:0", task=None)
+    randomizer = _setup(backend, num_envs=2, device="cuda:0")
     try:
-        for name in ("body_mass", "body_inertia", "body_ipos", "body_subtreemass"):
+        for name in (
+            "body_mass",
+            "body_ipos",
+            "body_inertia",
+            "body_iquat",
+            "body_subtreemass",
+        ):
             assert getattr(backend._m, name).shape[0] == 2, name
-        _assert_payload_weight_reaches_ground(backend)
-        body = backend._payload_body_id
-        torch.testing.assert_close(
-            backend._body_mass_native_t[:, body].cpu(), torch.tensor([0.0, 5.0])
+        _assert_payload_weight_reaches_ground(backend, randomizer)
+        root = backend._canonical_to_native_body_np[backend.body_names.index(ROOT_LINK)]
+        world_mass = backend._body_mass_native_t[:, root].cpu()
+        assert world_mass[1] == pytest.approx(float(world_mass[0]) + 5.0)
+    finally:
+        backend.close()
+
+
+@pytest.mark.vsim
+def test_vsim_applies_folded_payload_per_environment():
+    vsim_guard()
+    from gym.envs.base.vsim_backend import VSimBackend
+
+    backend = VSimBackend()
+    randomizer = _setup(backend, num_envs=2, device="cuda:0")
+    try:
+        # Mass properties need one environment per set.
+        assert backend._grp.get_num_environments() == [1, 1]
+        _assert_payload_weight_reaches_ground(backend, randomizer)
+
+        # The engine holds exactly the canonical values the backend reports.
+        bodies = backend._canonical_to_native_body
+        mass, inertia, body_to_model = (
+            value[:, bodies] for value in backend._read_link_inertials()
         )
+        torch.testing.assert_close(mass, backend.link_mass)
+        torch.testing.assert_close(inertia, backend.link_inertia)
+        torch.testing.assert_close(body_to_model[..., 0:4], backend.link_inertia_quat)
+        torch.testing.assert_close(body_to_model[..., 4:7], backend.link_com)
+        root = backend.body_names.index(ROOT_LINK)
+        assert not torch.equal(backend.link_com[0, root], backend.link_com[1, root])
     finally:
         backend.close()
 
@@ -250,34 +299,39 @@ def _build_go2payload_task(num_envs=4):
 
 
 def test_go2payload_task_resamples_payload_only_for_reset_envs():
+    from gym.envs.base.domain_randomization import payload_com_bounds
+
     env = _build_go2payload_task()
     try:
-        backend = env._backend
+        randomizer = env.domain_randomizer
         payload_cfg = env.cfg.domain_randomization.payload
         low, high = (torch.tensor(v) for v in payload_com_bounds(env.cfg))
 
         # The initial reset samples every environment.
-        initial_mass = backend.payload_mass.clone()
-        initial_com = backend.payload_com.clone()
+        initial_mass = randomizer.payload_mass.clone()
+        initial_com = randomizer.payload_com.clone()
         assert (
             (initial_mass >= payload_cfg.mass_range[0])
             & (initial_mass <= payload_cfg.mass_range[1])
         ).all()
         assert ((initial_com >= low - 1e-6) & (initial_com <= high + 1e-6)).all()
         assert initial_mass.unique().numel() == env.num_envs
+        initial_link_mass = env._backend.link_mass.clone()
 
         mask = torch.tensor([False, True, False, True])
         env._reset_idx(mask)
 
-        changed = backend.payload_mass != initial_mass
+        changed = randomizer.payload_mass != initial_mass
         assert torch.equal(changed, mask)
-        torch.testing.assert_close(backend.payload_com[~mask], initial_com[~mask])
-        body = backend._payload_body_id
-        for env_id in range(env.num_envs):
-            model = backend._models[env_id]
-            assert model.body_mass[body] == pytest.approx(
-                float(backend.payload_mass[env_id])
-            )
+        torch.testing.assert_close(randomizer.payload_com[~mask], initial_com[~mask])
+        torch.testing.assert_close(
+            env._backend.link_mass[~mask], initial_link_mass[~mask]
+        )
+        # Link-mass scales are startup-only; only the payload term moves.
+        torch.testing.assert_close(
+            env._backend.link_mass.sum(dim=1) - initial_link_mass.sum(dim=1),
+            randomizer.payload_mass - initial_mass,
+        )
 
         env.step()
         assert torch.isfinite(env.root_states).all()
@@ -294,18 +348,18 @@ def test_go2payload_payload_observation_is_critic_only_and_tracks_resets():
 
     env = _build_go2payload_task()
     try:
-        backend = env._backend
+        randomizer = env.domain_randomizer
         mount = torch.tensor(env.cfg.domain_randomization.payload.mount_pos)
 
-        def assert_matches_backend():
-            torch.testing.assert_close(env.payload_obs[:, 0], backend.payload_mass)
+        def assert_matches_randomizer():
+            torch.testing.assert_close(env.payload_obs[:, 0], randomizer.payload_mass)
             torch.testing.assert_close(
-                env.payload_obs[:, 1:], backend.payload_com - mount
+                env.payload_obs[:, 1:], randomizer.payload_com - mount
             )
 
-        assert_matches_backend()
+        assert_matches_randomizer()
         env._reset_idx(torch.tensor([True, False, True, False]))
-        assert_matches_backend()
+        assert_matches_randomizer()
 
         # Scaling maps the configured ranges into [-1, 1].
         scaled = env.get_state("payload_obs")
@@ -331,7 +385,8 @@ def test_go2payload_payload_observation_is_zero_when_disabled():
     task_registry.convert_frequencies_to_params(cfg, runner_cfg)
     env = Go2Payload(cfg, "cpu", True, select_backend(cfg, "cpu", "mujoco"))
     try:
-        assert env._backend._payload_body_id is None
+        assert env.domain_randomizer.payload_mass is None
+        assert env._backend._models is None  # no per-environment mass properties
         torch.testing.assert_close(env.payload_obs, torch.zeros(2, 4))
         env._reset_idx(torch.ones(2, dtype=torch.bool))
         torch.testing.assert_close(env.payload_obs, torch.zeros(2, 4))

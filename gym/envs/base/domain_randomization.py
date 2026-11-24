@@ -9,7 +9,9 @@ import zlib
 
 import torch
 
+from gym.envs.base.robot_layout import urdf_root_link
 from gym.utils.sampling import masked_update
+from gym.utils.torch_quat import quat_from_matrix, quat_to_matrix
 
 
 DOMAIN_RANDOMIZATION_MODES = (
@@ -42,14 +44,16 @@ class DomainRandomizationCfg:
         scale_ranges = {}
 
     class payload:
-        # Box welded to the base and resampled at every episode reset.
-        # Payload mass in kilograms; ``None`` disables the payload body.
+        # Solid box rigidly attached to the root link, resampled at every
+        # episode reset. It has no collision geometry, so it is applied
+        # exactly by folding its mass, COM, and inertia into the root link.
+        # Payload mass in kilograms; ``None`` disables the payload.
         mass_range = None
-        # Nominal box center in the base frame [m].
+        # Nominal box center in the root-link frame [m].
         mount_pos = [0.0, 0.0, 0.0]
         # Per-axis uniform COM offset from mount_pos, [[x], [y], [z]] in [m].
         com_offset_range = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
-        # Box dimensions [m], used for the inertia and the visual geom.
+        # Box dimensions [m], used for the inertia and the MuJoCo viewer box.
         size = [0.2, 0.12, 0.08]
 
 
@@ -179,7 +183,7 @@ def link_mass_scale_range(cfg) -> tuple[float, float] | None:
 def payload_mass_range(cfg) -> tuple[float, float] | None:
     """Return and validate the payload mass range in kilograms.
 
-    ``None`` disables the payload body entirely.
+    ``None`` disables the payload entirely.
     """
     values = _configured_range(cfg, "payload_mass_range")
     if values is None:
@@ -226,6 +230,70 @@ def payload_box_inertia(mass: torch.Tensor, size) -> torch.Tensor:
     return mass.unsqueeze(-1) * extents / 12.0
 
 
+def randomizes_link_inertials(cfg) -> bool:
+    """Whether any DR axis changes link mass properties after setup.
+
+    Backends use this to allocate per-environment mass properties.
+    """
+    return link_mass_scale_range(cfg) is not None or payload_mass_range(cfg) is not None
+
+
+def combine_inertials(
+    mass_a: torch.Tensor,
+    com_a: torch.Tensor,
+    inertia_a: torch.Tensor,
+    quat_a: torch.Tensor,
+    mass_b: torch.Tensor,
+    com_b: torch.Tensor,
+    inertia_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Mass properties of body *a* with body *b* rigidly attached to it.
+
+    Both bodies are described in *a*'s link frame: mass [...], COM [..., 3],
+    principal inertia [..., 3], and, for *a*, the scalar-last orientation of
+    its principal axes [..., 4]. *b*'s principal axes are the link axes.
+    Returns (mass, COM, principal inertia, principal-axis quaternion) of the
+    combination. Rows where *b* is massless return *a* unchanged, so a zero
+    payload reproduces the nominal link exactly.
+
+    Computed in float64: the combined tensor is re-diagonalized, and the
+    eigenvectors of nearly equal moments are sensitive to rounding.
+    """
+    dtype = mass_a.dtype
+    m_a, m_b = mass_a.double(), mass_b.double()
+    c_a, c_b = com_a.double(), com_b.double()
+    rotation_a = quat_to_matrix(quat_a.double())
+    tensor_a = rotation_a @ torch.diag_embed(inertia_a.double()) @ rotation_a.mT
+    tensor_b = torch.diag_embed(inertia_b.double())
+
+    mass = m_a + m_b
+    com = (m_a[..., None] * c_a + m_b[..., None] * c_b) / mass[..., None].clamp(
+        min=torch.finfo(torch.float64).tiny
+    )
+    eye = torch.eye(3, dtype=torch.float64, device=mass.device)
+
+    def about_com(tensor, body_mass, body_com):
+        # Parallel-axis theorem: m (|d|^2 I - d d^T) for the offset d.
+        d = body_com - com
+        outer = d[..., :, None] * d[..., None, :]
+        shift = (d * d).sum(-1)[..., None, None] * eye - outer
+        return tensor + body_mass[..., None, None] * shift
+
+    tensor = about_com(tensor_a, m_a, c_a) + about_com(tensor_b, m_b, c_b)
+    moments, axes = torch.linalg.eigh(0.5 * (tensor + tensor.mT))
+    # Eigenvectors may form a reflection; flip one axis to make a rotation.
+    axes[..., :, 2] *= torch.linalg.det(axes).sign()[..., None]
+    quat = quat_from_matrix(axes)
+
+    attached = (m_b > 0.0)[..., None]
+    return (
+        torch.where(attached[..., 0], mass, m_a).to(dtype),
+        torch.where(attached, com, c_a).to(dtype),
+        torch.where(attached, moments, inertia_a.double()).to(dtype),
+        torch.where(attached, quat, quat_a.double()).to(dtype),
+    )
+
+
 class DomainRandomizer:
     def __init__(self, cfg, backend, device: str) -> None:
         self._backend = backend
@@ -235,10 +303,19 @@ class DomainRandomizer:
         self._payload_mass_range = payload_mass_range(cfg)
         self._payload_com_low = None
         self._payload_com_high = None
+        self._payload_mount_pos = None
+        self._payload_size = None
+        self._payload_root_link = None
         if self._payload_mass_range is not None:
             low, high = payload_com_bounds(cfg)
             self._payload_com_low = torch.tensor(low, device=device)
             self._payload_com_high = torch.tensor(high, device=device)
+            payload_cfg = cfg.domain_randomization.payload
+            self._payload_mount_pos = torch.tensor(
+                [float(v) for v in payload_cfg.mount_pos], device=device
+            )
+            self._payload_size = [float(v) for v in payload_cfg.size]
+            self._payload_root_link = urdf_root_link(cfg)
         self._episode_scale_ranges = {}
         for name in cfg.domain_randomization.episode.scale_ranges:
             values = scale_range(cfg, name)
@@ -281,6 +358,11 @@ class DomainRandomizer:
                 self._generators["payload"] = generator
 
         self.link_mass_scale = None
+        self._randomizes_link_inertials = randomizes_link_inertials(cfg)
+        self._nominal_link_inertials = None
+        self._payload_root_body = None
+        self._payload_mass = None
+        self._payload_com = None
         self._payload_mass_candidates = None
         self._payload_com_candidates = None
         self._episode_targets = {}
@@ -288,9 +370,107 @@ class DomainRandomizer:
         self._episode_scales = {}
         self._episode_candidates = {}
 
-    def bind_link_masses(self) -> None:
+    def bind_link_inertials(self) -> None:
+        """Capture the backend's nominal link mass properties after setup."""
+        if not self._randomizes_link_inertials:
+            return
+        backend = self._backend
+        # Every environment still holds the nominal values before startup DR.
+        self._nominal_link_inertials = tuple(
+            value[:1].clone()
+            for value in (
+                backend.link_mass,
+                backend.link_com,
+                backend.link_inertia,
+                backend.link_inertia_quat,
+            )
+        )
         if self._link_mass_scale_range is not None:
-            self.link_mass_scale = torch.ones_like(self._backend.link_mass)
+            self.link_mass_scale = torch.ones_like(backend.link_mass)
+        if self._payload_mass_range is not None:
+            num_envs = backend.link_mass.shape[0]
+            self._payload_root_body = backend.body_names.index(self._payload_root_link)
+            self._payload_mass = torch.zeros(num_envs, device=self._device)
+            self._payload_com = self._payload_mount_pos.repeat(num_envs, 1)
+
+    @property
+    def payload_mass(self) -> torch.Tensor | None:
+        """[num_envs] applied payload masses [kg], or ``None`` when disabled."""
+        return self._payload_mass
+
+    @property
+    def payload_com(self) -> torch.Tensor | None:
+        """[num_envs, 3] applied payload COM in the root-link frame [m]."""
+        return self._payload_com
+
+    def _apply_link_inertials(self, env_ids: torch.Tensor) -> None:
+        """Rebuild selected environments' link mass properties from nominal.
+
+        The link-mass scale applies first; the payload then joins the scaled
+        root link. One backend call keeps Warp to one constant recompute.
+        """
+        mass, com, inertia, quat = (
+            value.expand(env_ids.numel(), *value.shape[1:]).clone()
+            for value in self._nominal_link_inertials
+        )
+        if self.link_mass_scale is not None:
+            scales = self.link_mass_scale[env_ids]
+            mass *= scales
+            inertia *= scales.unsqueeze(-1)
+        if self._payload_mass is not None:
+            root = self._payload_root_body
+            link = (mass, com, inertia, quat)
+            payload_mass = self._payload_mass[env_ids]
+            combined = combine_inertials(
+                *(value[:, root] for value in link),
+                payload_mass,
+                self._payload_com[env_ids],
+                payload_box_inertia(payload_mass, self._payload_size),
+            )
+            for value, root_value in zip(link, combined):
+                value[:, root] = root_value
+        self._backend.set_link_inertials(env_ids, mass, com, inertia, quat)
+
+    def set_payload(
+        self,
+        env_ids: torch.Tensor,
+        masses: torch.Tensor,
+        coms: torch.Tensor,
+    ) -> None:
+        """Attach explicit payloads to selected environments.
+
+        *coms* are payload COM positions in the root-link frame. Used by
+        episode randomization and by scripts that sweep fixed payloads.
+        """
+        if self._payload_mass_range is None:
+            raise RuntimeError(
+                "payload was not enabled before setup; set "
+                "domain_randomization.payload.mass_range"
+            )
+        if self._payload_mass is None:
+            raise RuntimeError(
+                "bind_link_inertials() must run after backend setup, before "
+                "payload updates"
+            )
+        ids = torch.as_tensor(env_ids, dtype=torch.long, device=self._device)
+        ids = ids.flatten()
+        mass_values = torch.as_tensor(
+            masses, dtype=torch.float, device=self._device
+        ).flatten()
+        com_values = torch.as_tensor(coms, dtype=torch.float, device=self._device)
+        if mass_values.numel() != ids.numel() or com_values.shape != (ids.numel(), 3):
+            raise ValueError(
+                "one payload mass and 3D COM are required per environment: "
+                f"{ids.numel()} ids vs masses {tuple(mass_values.shape)}, "
+                f"coms {tuple(com_values.shape)}"
+            )
+        if bool((mass_values < 0.0).any()):
+            raise ValueError("payload masses must be non-negative")
+        if ids.numel() == 0:
+            return
+        self._payload_mass[ids] = mass_values
+        self._payload_com[ids] = com_values
+        self._apply_link_inertials(ids)
 
     def bind_episode_targets(self, targets: dict[str, torch.Tensor]) -> None:
         for name in self._episode_scale_ranges:
@@ -351,7 +531,7 @@ class DomainRandomizer:
                 self._generators["link_mass"],
             )
             self.link_mass_scale[env_ids] = scales
-            self._backend.set_link_mass_scale(env_ids, scales)
+            self._apply_link_inertials(env_ids)
 
     def randomize_episode(self, reset_mask: torch.Tensor) -> None:
         """Resample configured task tensors for resetting environments."""
@@ -389,5 +569,4 @@ class DomainRandomizer:
         env_ids = reset_mask.nonzero(as_tuple=False).flatten()
         if env_ids.numel() == 0:
             return
-        # One backend call, so Warp recomputes model constants once per reset.
-        self._backend.set_payload(env_ids, masses[env_ids], coms[env_ids])
+        self.set_payload(env_ids, masses[env_ids], coms[env_ids])

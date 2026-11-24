@@ -20,7 +20,6 @@ _YAW_RGBA = np.array([0.25, 0.55, 1.0, 1.0], dtype=np.float32)
 _HEIGHT_RGBA = np.array([0.75, 0.35, 0.95, 1.0], dtype=np.float32)  # purple
 
 
-
 def _add_connector(viewer, geom_type, width, start, end, rgba):
     if viewer.user_scn.ngeom >= len(viewer.user_scn.geoms):
         return
@@ -48,7 +47,7 @@ class CommandVisualizer:
         yaw_radius=0.18,
         yaw_arc_scale=0.5,
         arc_segments_per_rad=12,
-        height_scale = 3.0,
+        height_scale=3.0,
     ):
         self.env = env
         self.scale = scale
@@ -131,7 +130,7 @@ class CommandVisualizer:
             return
         if not hasattr(viewer, "set_texts"):
             return
-        masses = self.env._backend.payload_mass.detach().cpu()
+        masses = self.env.domain_randomizer.payload_mass.detach().cpu()
         labels = ["Payload (robot 0)"]
         values = [f"{float(masses[0]):.2f} kg"]
         if len(masses) > 1:

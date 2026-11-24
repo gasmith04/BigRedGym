@@ -40,9 +40,8 @@ def test_arrows_follow_canonical_root_pose_without_native_simulator_data(monkeyp
 
 def _payload_env(enabled):
     env = SimpleNamespace(
-        _backend=SimpleNamespace(
-            _viewer_overlay_fn=None, payload_mass=torch.tensor([2.5, 0.4, 4.8])
-        ),
+        _backend=SimpleNamespace(_viewer_overlay_fn=None),
+        domain_randomizer=SimpleNamespace(payload_mass=torch.tensor([2.5, 0.4, 4.8])),
         _payload_enabled=enabled,
         commands=torch.zeros(3, 3),
         root_states=torch.zeros(3, 13),

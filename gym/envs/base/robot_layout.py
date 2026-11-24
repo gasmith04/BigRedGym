@@ -52,6 +52,25 @@ def _urdf_names(asset_path: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return dof_names, body_names
 
 
+def urdf_root_link(cfg) -> str:
+    """Name of the asset's root link: the one URDF link that is no joint's child.
+
+    Every backend roots the articulation here (MuJoCo's first body, VSim's
+    link 0), so it is the backend-neutral body that carries the free joint.
+    """
+    asset_path = cfg.asset.file.format(GYM_ROOT_DIR=GYM_ROOT_DIR)
+    root = ET.parse(asset_path).getroot()
+    children = {joint.find("child").get("link") for joint in root.findall("joint")}
+    roots = [
+        link.get("name")
+        for link in root.findall("link")
+        if link.get("name") not in children
+    ]
+    if len(roots) != 1:
+        raise ValueError(f"expected one URDF root link, got {roots}")
+    return roots[0]
+
+
 def _validate_members(
     groups: Mapping[str, tuple[str, ...]],
     valid_names: tuple[str, ...],

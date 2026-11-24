@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -89,6 +90,37 @@ def test_configs_saved_before_the_stride_keep_stepping_in_place():
     task.cfg.control = SimpleNamespace()
     task.phase = torch.zeros(1, 1)
     assert not task._stride_offset().any()
+
+
+def _smoothing_task(**control):
+    task = Go2Payload.__new__(Go2Payload)
+    task.cfg = SimpleNamespace(control=SimpleNamespace(**control))
+    task.dt = 0.02
+    task.num_actuators = 12
+    task._init_action_smoothing()
+    return task
+
+
+def test_action_smoothing_matches_the_deploy_runner_ema():
+    task = _smoothing_task(action_ema_time_const=0.02)
+    # deploy_config.py: alpha = -expm1(-(1 / ctrl_freq) / ema_time_const)
+    assert task._action_ema_alpha == pytest.approx(1 - math.exp(-1.0))
+
+    previous, new = torch.full((1, 12), 0.2), torch.full((1, 12), 1.0)
+    # dof_pos_history holds 3 steps; the newest applied target comes first.
+    task.dof_pos_history = torch.cat((previous, torch.zeros(1, 24)), dim=1)
+    alpha = task._action_ema_alpha
+    torch.testing.assert_close(
+        task._smooth_dof_pos_target(new), alpha * new + (1 - alpha) * previous
+    )
+
+
+@pytest.mark.parametrize("control", [{}, {"action_ema_time_const": 0.0}])
+def test_smoothing_is_off_when_disabled_or_absent_from_saved_configs(control):
+    task = _smoothing_task(**control)
+    task.dof_pos_history = torch.full((1, 36), 0.2)
+    new = torch.full((1, 12), 1.0)
+    torch.testing.assert_close(task._smooth_dof_pos_target(new), new)
 
 
 def test_policy_runs_at_50hz_over_200hz_physics():

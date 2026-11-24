@@ -200,7 +200,11 @@ def evaluate(
         env.commands[:] = commands
         actions = runner.get_inference_actions()
         runner.set_actions(runner.actor_cfg["actions"], actions)
-        requested = env.dof_pos_target.clone()
+        # Smoothing is intended, so only count what clipping discards after it.
+        if hasattr(env, "_smooth_dof_pos_target"):
+            requested = env._smooth_dof_pos_target(env.dof_pos_target)
+        else:
+            requested = env.dof_pos_target.clone()
         phase = env.phase.clone()
         env.step()
         alive &= ~env.terminated
@@ -262,8 +266,9 @@ def main():
         "--frequencies",
         type=float,
         nargs="+",
-        default=[1.0, 2.0, 3.0],
-        help="gait frequencies [Hz]; deploy runs at 2",
+        default=None,
+        help="gait frequencies [Hz]; default: ends and middle of the task's "
+        "training gait_freq. Deploy runs at 2",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--check", action="store_true")
@@ -281,6 +286,9 @@ def main():
             load_run=args.load_run,
         )
     )
+    if args.frequencies is None:
+        low, high = env_cfg.control.gait_freq
+        args.frequencies = sorted({low, (low + high) / 2, high})
     env_cfg.env.num_envs = len(COMMANDS) * len(args.frequencies) * args.replicas
     env_cfg.env.episode_length_s = args.seconds + 1
     env_cfg.commands.resampling_time = args.seconds + 1
@@ -317,7 +325,9 @@ def main():
         env._backend.close()
     report = {
         # v2: forward_brisk case, signed velocity bias, --frequencies.
-        "protocol": "go2trot-v2",
+        # v3: frequencies default to the task's gait_freq; clipping is
+        # measured after action smoothing.
+        "protocol": "go2trot-v3",
         "jitter_cutoff_hz": 10.0,
         "checkpoint": str(path.resolve()),
         "checkpoint_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),

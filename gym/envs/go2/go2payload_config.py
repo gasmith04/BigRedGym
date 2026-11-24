@@ -8,12 +8,19 @@ class Go2PayloadCfg(Go2TrotCfg):
         desired_sim_frequency = 200
         # Reward-only fore-aft thigh sweep [rad] that scales with commanded
         # speed. 0.6 rad moves the foot about +/-0.17 m, which covers 1.4 m/s
-        # at 2 Hz and 2.1 m/s at 3 Hz.
+        # at 2 Hz (1.2 to 1.6 m/s across gait_freq).
         stride_amplitude_max = 0.6
+        # Narrow band around deploy's fixed 2 Hz gait clock.
+        gait_freq = [1.75, 2.25]
+        # Action EMA time constant [s]; set the deploy runner's ema_time_const
+        # to the same value. 0.02 s gives alpha = 0.63 at 50 Hz, halving
+        # alternating 25 Hz jitter while lagging the 2 Hz gait by ~14 deg.
+        action_ema_time_const = 0.02
 
     class commands(Go2TrotCfg.commands):
         class ranges(Go2TrotCfg.commands.ranges):
-            lin_vel_x = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.75, 2.5]
+            # Tops out where the capped reference stride can still keep up.
+            lin_vel_x = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5]
             # Fixed height: the actor doesn't observe it, matching deploy.
             base_height = [0.30, 0.30]
 

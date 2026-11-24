@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from gym.envs.base.domain_randomization import payload_mass_range
@@ -26,6 +28,24 @@ class Go2Payload(Go2Trot):
             dtype=torch.float,
             device=self.device,
         )
+        self._init_action_smoothing()
+
+    def _init_action_smoothing(self):
+        """Same EMA as the deploy runner: alpha = 1 - exp(-ctrl_dt / tau)."""
+        # Configs saved before smoothing existed apply raw actions.
+        tau = getattr(self.cfg.control, "action_ema_time_const", 0.0)
+        self._action_ema_alpha = -math.expm1(-self.dt / tau) if tau > 0 else 1.0
+
+    def _smooth_dof_pos_target(self, target):
+        """Blend a new action with the last applied target, as deploy does."""
+        previous = self.dof_pos_history[:, : self.num_actuators]
+        alpha = self._action_ema_alpha
+        return alpha * target + (1 - alpha) * previous
+
+    def _pre_decimation_step(self):
+        super()._pre_decimation_step()
+        # The actor observes the smoothed target, matching deploy's last_action.
+        self.dof_pos_target = self._smooth_dof_pos_target(self.dof_pos_target)
 
     def _reset_idx(self, reset_mask):
         super()._reset_idx(reset_mask)

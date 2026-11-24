@@ -81,6 +81,16 @@ def test_stationary_policy_fails_a_small_forward_command():
     assert "linear_rmse_m_s" in result["failures"]
 
 
+def test_velocity_bias_is_signed_per_axis():
+    trace = ideal_trace()
+    trace["velocity"][:, :, 0] = 0.3
+    trace["velocity"][:, :, 2] = 0.6
+    result = summarize_case(trace, 0.01, 200, 2.0, torch.tensor([0.5, 0.0, 0.5]))
+    assert result["vx_bias_m_s"] == pytest.approx(-0.2)
+    assert result["vy_bias_m_s"] == pytest.approx(0.0)
+    assert result["yaw_bias_rad_s"] == pytest.approx(0.1)
+
+
 def test_balanced_feet_must_carry_the_body_weight():
     trace = ideal_trace()
     trace["load"] *= 0.25

@@ -22,6 +22,7 @@ COMMANDS = {
     "stopped": (0.0, 0.0, 0.0),
     "forward_slow": (0.5, 0.0, 0.0),
     "forward": (1.0, 0.0, 0.0),
+    "forward_brisk": (1.5, 0.0, 0.0),
     "forward_fast": (2.0, 0.0, 0.0),
     "reverse": (-0.5, 0.0, 0.0),
     "left": (0.0, 0.5, 0.0),
@@ -81,6 +82,12 @@ def summarize_case(trace, dt, warmup_steps, frequency, command):
         (trace["velocity"][..., :2] - command[:2]).norm(dim=-1)
     )
     result["yaw_rmse_rad_s"] = rms(trace["velocity"][..., 2] - command[2])
+    # Signed mean error separates undershoot from overshoot; RMSE cannot.
+    # Diagnostic only, so gating stays comparable across protocol versions.
+    bias = (trace["velocity"][valid] - command).mean(dim=0)
+    result["vx_bias_m_s"] = bias[0].item()
+    result["vy_bias_m_s"] = bias[1].item()
+    result["yaw_bias_rad_s"] = bias[2].item()
     pair_valid = valid[1:] & valid[:-1]
     result["residual_step_rms_rad"] = rms(trace["residual"].diff(dim=0), pair_valid)
     result["joint_acceleration_rms_rad_s2"] = rms(
@@ -159,8 +166,10 @@ def summarize_case(trace, dt, warmup_steps, frequency, command):
 
 
 @torch.no_grad()
-def evaluate(env, runner, *, replicas=4, seconds=8.0, warmup=2.0):
-    cases = [(name, hz) for name in COMMANDS for hz in (1.0, 2.0, 3.0)]
+def evaluate(
+    env, runner, *, replicas=4, seconds=8.0, warmup=2.0, frequencies=(1.0, 2.0, 3.0)
+):
+    cases = [(name, hz) for name in COMMANDS for hz in frequencies]
     commands = torch.tensor(
         [COMMANDS[name] for name, _ in cases], device=env.device
     ).repeat_interleave(replicas, dim=0)
@@ -249,6 +258,13 @@ def main():
     parser.add_argument("--replicas", type=int, default=4)
     parser.add_argument("--seconds", type=float, default=8)
     parser.add_argument("--warmup", type=float, default=2)
+    parser.add_argument(
+        "--frequencies",
+        type=float,
+        nargs="+",
+        default=[1.0, 2.0, 3.0],
+        help="gait frequencies [Hz]; deploy runs at 2",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
@@ -265,7 +281,7 @@ def main():
             load_run=args.load_run,
         )
     )
-    env_cfg.env.num_envs = len(COMMANDS) * 3 * args.replicas
+    env_cfg.env.num_envs = len(COMMANDS) * len(args.frequencies) * args.replicas
     env_cfg.env.episode_length_s = args.seconds + 1
     env_cfg.commands.resampling_time = args.seconds + 1
     env_cfg.push_robots.toggle = False
@@ -295,11 +311,13 @@ def main():
             replicas=args.replicas,
             seconds=args.seconds,
             warmup=args.warmup,
+            frequencies=args.frequencies,
         )
     finally:
         env._backend.close()
     report = {
-        "protocol": "go2trot-v1",
+        # v2: forward_brisk case, signed velocity bias, --frequencies.
+        "protocol": "go2trot-v2",
         "jitter_cutoff_hz": 10.0,
         "checkpoint": str(path.resolve()),
         "checkpoint_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
